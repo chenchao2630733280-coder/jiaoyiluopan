@@ -6434,11 +6434,24 @@ function renderShort() {
             (s.strength || 0).toFixed(1) + '</span>' +
           '<span class="mut">' + esc(s.grade || "") + '</span>' +
           '<span class="mut">' + (s.n || 0) + ' 只 · 涨停 ' + (s.zt_cnt || 0) + ' 家</span>' +
+          (s.partial ? '<span class="badge b-gold" title="成分未取全，强度可能偏高">⚠ 未取全</span>' : '') +
           '<span class="mut">主力 ' + (s.main_net_yi > 0 ? "+" : "") + (s.main_net_yi || 0).toFixed(2) + ' 亿</span>' +
           '</div>' + (lad ? '<div class="ladder">' + lad + '</div>' : '');
       }).join("");
     var anchor = document.getElementById("shortPoolTabs");
     if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(bd, anchor);
+  } else if (d.sectors_note) {
+    /* 空态必须说出来：以前 secs 为空就整块删掉，页面上看不出是"今天没主线"
+       还是"板块接口挂了"，只能靠人去猜。 */
+    var bd0 = document.createElement("div");
+    bd0.id = "shortSectors";
+    bd0.className = "notebox";
+    bd0.style.marginTop = "10px";
+    bd0.innerHTML = '<b>主线板块未取到</b><span class="mut">' + esc(d.sectors_note) +
+      '。六个池仍然可用，但「先看环境、再看板块」这一步今天缺数据，' +
+      '别把个股强度当成板块强度。</span>';
+    var anchor0 = document.getElementById("shortPoolTabs");
+    if (anchor0 && anchor0.parentNode) anchor0.parentNode.insertBefore(bd0, anchor0);
   }
 
   /* 龙虎榜说明条 + 独立刷新按钮。

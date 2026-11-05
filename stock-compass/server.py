@@ -44,6 +44,7 @@ import tactics
 import liveradar
 import report_docx
 import edge
+import short
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 可写数据目录见 engine.py 同名注释：桌面便携版把 state/ 钉在 exe 旁边，
@@ -2226,7 +2227,9 @@ def api_rescan(params):
     不塞进 engine 的全市场扫描状态里，否则两个进度会互相覆盖。
     """
     target = params.get("target") or "all"
-    local = {"tactics": tactics, "review": review}.get(target)
+    # lhb = 短线页的龙虎榜刷新（约 3~5 秒），走 short 自己的进度状态，
+    # 不塞进 engine 的全市场扫描状态，否则会和其它页签的进度互相覆盖。
+    local = {"tactics": tactics, "review": review, "lhb": short}.get(target)
     if _truthy(params.get("status")):
         st = engine.scan_state()
         lst = local.status() if local else {}
@@ -2331,6 +2334,7 @@ GET_ROUTES = {    "health": lambda p: {"ok": True, "service": "rightside-compass
     "knowledge": knowledge.api_knowledge,
     "review": review.api_review,
     "edge": edge.api_edge,
+    "short": short.api_short,
     "tactics": tactics.api_tactics,
     "tacticscheck": tactics.api_tacticscheck,
     "liveradar": liveradar.api_liveradar,

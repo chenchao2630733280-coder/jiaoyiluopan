@@ -9,6 +9,8 @@ stock-compass/data/kline/
 stock-compass/data/snapshot.json
 stock-compass/data/right_side.json
 stock-compass/data/strong.json
+# 龙虎榜明细只有当日有效，天天变，不进仓库（index/industry/methodology 是静态的，保留）
+stock-compass/data/lhb.json
 
 # ---- 运行时状态（扫描结果、验证结果、日志）----
 stock-compass/state/
@@ -21,11 +23,12 @@ __pycache__/
 .venv/
 venv/
 
-# ---- 临时验证产物（截图、备份、探针脚本）----
+# ---- 临时验证产物（截图、备份、探针脚本、探针输出）----
 stock-compass/_*.png
 stock-compass/_*.html
 stock-compass/_*.js
 stock-compass/_*.py
+stock-compass/_*.json
 
 # ---- 系统 / 编辑器 ----
 Thumbs.db
