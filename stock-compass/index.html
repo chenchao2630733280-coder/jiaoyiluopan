@@ -3833,6 +3833,10 @@ td .rsc-pill,th .rsc-pill{max-width:none}
 
       <span class="pill" id="mktStatus">--</span>
 
+      <!-- 日K 口径标记：日K 停在昨天而实时数据已是今天时显示。
+           不标的话，用户看到各页「交易日 昨天」只会以为是拉取失败。 -->
+      <span class="pill" id="klineStatus" hidden></span>
+
       <span class="pill" id="clock">--:--:--</span>
 
       <!-- 全屏：优先用浏览器原生 Fullscreen API（覆盖系统托盘/任务栏，观感最好）；
@@ -6158,7 +6162,37 @@ function checkBackend() {
 
     markBackend(((r.headers.get("content-type") || "").indexOf("json") >= 0) && r.ok);
 
+    loadKlineStatus();
+
   }).catch(function () { markBackend(false); });
+
+}
+
+/* 日K 口径提示：收盘后日K要等数据源补当日那根，而指数/涨跌家数/涨停池立刻就是今天的。
+   两者不一致时在页头标出来 —— 否则各页只显示「交易日 昨天」，看着像拉取失败。
+   日K 到位后接口自动返回 lag=false，这个 pill 自己消失。 */
+
+function loadKlineStatus() {
+
+  fetch("/api/kline_status", { cache: "no-store" })
+
+    .then(function (r) { return r.json(); })
+
+    .then(function (d) {
+
+      var el = $("#klineStatus"); if (!el) return;
+
+      if (!d || !d.lag) { el.hidden = true; el.textContent = ""; el.title = ""; return; }
+
+      el.hidden = false;
+
+      el.className = "pill rest";
+
+      el.textContent = "日K " + (d.kline_date || "--") + " · 待更新";
+
+      el.title = d.note || "";
+
+    }).catch(function () { });
 
 }
 
@@ -6193,6 +6227,9 @@ setInterval(function () {
   var el = $("#mktStatus"); el.textContent = st[0]; el.className = "pill " + st[1];
 
 }, 1000);
+
+// 日K 状态每 5 分钟看一眼：数据源补上当日那根后，页头提示要自己消失
+setInterval(loadKlineStatus, 300000);
 
 
 

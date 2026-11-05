@@ -1984,8 +1984,13 @@ def api_short(params):
     #   此时**不能**拿「今天的涨停池 + 昨天的日 K 特征」判涨停接力 ——
     #   封单额是今天的、量比是昨天的，几个条件之间互相错位，判出来的票没意义。
     #   整页统一退回日 K 口径，再把实时日期单独报出去，让页面能说清「为什么还是昨天」。
+    # ★ 两个日期来源格式不同，必须先统一再比：
+    #   engine.latest_trade_date() 给 2026-11-05（带横线，直接给前端展示），
+    #   server.api_sentiment 的 trade_date 给 2026-11-05（展示用）→ 去掉横线成 20261105。
+    #   早先拿 20261105 直接跟 2026-11-05 比，永远不等 —— 明明同一天也报「日K待更新」。
+    td_key = str(td).replace("-", "")
     live_td = str(sent.get("trade_date") or "").replace("-", "")
-    kline_lag = bool(live_td and live_td != td)
+    kline_lag = bool(live_td and live_td != td_key)
     kline_lag_err = ""
     # 选股口径（同日池）：涨停候选必须与日 K 同一天，否则判定条件错位
     sent_asof = sent

@@ -2326,9 +2326,35 @@ def api_stub(name, params):
 # 路由
 # ----------------------------------------------------------------------------
 
+def api_kline_status(params):
+    """日 K 口径 vs 实时口径的日期差：用来解释「为什么页面上的交易日还是昨天」。
+
+    ★ 两个日期不一致是**正常现象**，不是故障：收盘后日 K 要等数据源补当日那根
+      （2026-11-05 15:15 实测：新浪个股日 K 仍停在 11-04，东财日 K 已有 11-05），
+      而指数、涨跌家数、涨停池这些实时数据立刻就是当天的。
+      页面必须能一眼看出是「在等数据源」而不是「程序坏了」——
+      否则用户只会看到「交易日 昨天」，然后以为拉取失败。
+    """
+    k = str(engine.latest_trade_date() or "")
+    l = str(latest_trade_date() or "")
+
+    def dash(s):
+        return "%s-%s-%s" % (s[0:4], s[4:6], s[6:8]) if len(s) == 8 else s
+
+    kd, ld = dash(k), dash(l)
+    lag = bool(kd and ld and kd != ld)
+    return {
+        "ok": True, "kline_date": kd, "live_date": ld, "lag": lag,
+        "note": ("日 K 数据源还没生成 %s 那一根：所有基于日 K 的榜单仍按 %s 收盘计算，"
+                 "指数、涨跌家数、涨停池为实时值。日 K 到位后自动切换。" % (ld, kd)
+                 if lag else ""),
+    }
+
+
 GET_ROUTES = {    "health": lambda p: {"ok": True, "service": "rightside-compass-replica",
                          "name": "A股右侧交易罗盘 · 复刻版", "port": RUNTIME_PORT[0],
                          "scan": engine.scan_state()},
+    "kline_status": api_kline_status,
     "quotes": api_quotes,
     "kline": api_kline,
     "search": api_search,

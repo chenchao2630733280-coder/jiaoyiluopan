@@ -402,6 +402,20 @@ def latest_trade_date():
 
     rows = _kline_fetch_raw("sh000001", 4)
     td = rows[-1][0] if rows else (disk.get("td") or today)
+
+    # ★ 新浪的指数日 K 与个股日 K **不是同时更新**的：2026-11-05 15:33 实测，
+    #   sh600000 / sz300750 已经有当日那根，而 sh000001 还停在 11-04。
+    #   只拿指数当判据会形成死锁：td 停在昨天 → ensure_klines 认为「已到位」
+    #   → 一只都不重抓 → 个股明明有今天的数据也永远进不来。
+    #   所以指数还没到今天就再探两只高流动性个股（一沪一深），取最大日期。
+    #   日 K 不可能出现未来日期，这里用系统日期兜住异常值。
+    if td < today:
+        for probe in ("sh600000", "sz000001"):
+            pr = _kline_fetch_raw(probe, 2)
+            if pr and pr[-1][0] > td and pr[-1][0] <= today:
+                td = pr[-1][0]
+                rows = pr
+
     write_json(INDEX_FILE, {
         "td": td, "fetched": today, "checked_ts": time.time(),
         "prev": rows[-2][0] if rows and len(rows) > 1 else td,
