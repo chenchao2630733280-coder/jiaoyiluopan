@@ -11,12 +11,17 @@
   3. 本站自己的口径说明（不做数浪、权重怎么来的、为什么给不出目标价）。
 **不含任何书籍正文与原文摘录**，也不含具体标的推荐。
 
-为什么放在 .py 而不是 data/knowledge.json
------------------------------------------
-`data/` 目录的约定是「可安全删除，会重建」，知识库是人工整理的一次性内容，
-删了就没了。放代码里跟 gold.py / ind15.py 一致，也方便检索逻辑与内容同处一文件。
+为什么内容放在 kb_content.json（而不是 data/，也不是全塞进本文件）
+--------------------------------------------------------------------------
+`data/` 目录的约定是「可安全删除、会重建」，知识库是人工整理的一次性内容，
+删了就没了 —— 所以不能放 data/。
+但 30 本书 / 55 组清单 / 68 条问答全写成 Python 字面量会让本文件膨胀到几千行，
+检索逻辑被内容淹没。折中：内容放同级的 kb_content.json（随仓库提交），
+本文件只保留检索逻辑与同义词表；文件缺失时退回内置的 12 本精简版，不至于整页空白。
 """
 
+import json
+import os
 import re
 import time
 
@@ -373,6 +378,48 @@ FAQ = [
 # ----------------------------------------------------------------------------
 
 # 同义词扩展：用户问「仓位」时也要能命中「头寸/资金管理」
+# ---------------------------------------------------------------------------
+# 内容来源：优先读 kb_content.json（30 本书 / 55 组清单 / 68 条问答），
+# 文件不存在时退回上面内置的精简版，保证接口永远有东西返回。
+# ---------------------------------------------------------------------------
+_KB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kb_content.json")
+
+
+def _load_content():
+    try:
+        with open(_KB_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except Exception:
+        return None
+    books = d.get("books") or []
+    sections = d.get("sections") or []
+    faq = d.get("faq") or []
+    if not (books and sections and faq):
+        return None
+    # 逐条校验形状：检索逻辑假设 book 有 title/focus/tagline/points/note/author，
+    # section 有 icon/title/book/items[{k,v}]，faq 有 q/a/tags。缺字段的内容文件直接拒绝，
+    # 免得把 KeyError 埋到 search() 里。
+    for b in books:
+        if not all(k in b for k in ("title", "focus", "tagline", "points", "note", "author")):
+            return None
+    for s in sections:
+        if "items" not in s or "title" not in s:
+            return None
+        for it in s["items"]:
+            if not isinstance(it, dict) or "k" not in it or "v" not in it:
+                return None
+    for f in faq:
+        if not (f.get("q") and f.get("a")):
+            return None
+    return (books, sections, faq, d.get("version") or VERSION,
+            d.get("disclaimer") or DISCLAIMER)
+
+
+_ext = _load_content()
+if _ext:
+    BOOKS, SECTIONS, FAQ, VERSION, DISCLAIMER = _ext
+
+
 SYNONYMS = {
     "仓位": ["头寸", "资金管理", "风险预算", "买多少"],
     "止损": ["失效位", "割肉", "离场"],
