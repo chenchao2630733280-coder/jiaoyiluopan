@@ -9,7 +9,9 @@ stock-compass/data/kline/
 stock-compass/data/snapshot.json
 stock-compass/data/right_side.json
 stock-compass/data/strong.json
-# 龙虎榜明细只有当日有效，天天变，不进仓库（index/industry/methodology 是静态的，保留）
+# 交易日索引：只有 td / checked_ts / prev 三个字段，每跑一次就变，属于运行时状态
+stock-compass/data/index.json
+# 龙虎榜明细只有当日有效，天天变，不进仓库（industry/methodology 是静态的，保留）
 stock-compass/data/lhb.json
 
 # ---- 运行时状态（扫描结果、验证结果、日志）----
