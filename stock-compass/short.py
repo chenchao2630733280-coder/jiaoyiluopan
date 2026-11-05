@@ -528,13 +528,23 @@ def _sectors(streak_map, diag=None):
             continue
 
         codes = {str(x.get("f12")) for x in rows}
-        dup = False
-        for prev in kept_sets:
+
+        # 父子板块去重：重叠 ≥85% 时**保留更宽的那个**。
+        # 判定方向不能是「先到先得」—— 子板块资金流常排在父板块前面，
+        # 那样「半导体设备」（25 只）会把「半导体」（188 只）顶掉，
+        # 结果拿一个 25 只的细分当主线，涨停占比也会被小样本放大。
+        drop_self = False
+        for i, prev in enumerate(kept_sets):
             inter = len(codes & prev)
-            if inter and inter / float(min(len(codes), len(prev))) >= 0.85:
-                dup = True
-                break
-        if dup:
+            if not inter or inter / float(min(len(codes), len(prev))) < 0.85:
+                continue
+            if len(codes) <= len(prev) * 1.15:
+                drop_self = True
+            else:
+                out.pop(i)
+                kept_sets.pop(i)
+            break
+        if drop_self:
             continue
 
         pcts = sorted(float(x["f3"]) for x in rows)
