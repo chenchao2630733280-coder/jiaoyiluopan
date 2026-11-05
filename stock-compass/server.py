@@ -2365,30 +2365,41 @@ class Handler(SimpleHTTPRequestHandler):
         super().__init__(*a, directory=BASE_DIR, **kw)
 
     # --- 工具 ---
+    # 客户端先断开（关页面 / 切页签 / 强刷 / 浏览器预连接取消）时，往 socket 写会抛这三个。
+    # 以前不接：_json 抛 → 兜底再写 500 又抛 → 异常冒到 socketserver，满屏 traceback，
+    # 严重时整个后端进程直接退出。
+    _BROKEN = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+
     def _json(self, obj, code=200):
         raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(raw)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(raw)
+        except self._BROKEN:
+            self.close_connection = True
 
     def _file(self, blob, filename, mime):
         """二进制下载：前端会先校验 Content-Type 再 a[download]，
         所以这里必须给对 wordprocessingml，并且文件名走 RFC 5987 的 filename*="""
         from urllib.parse import quote
-        self.send_response(200)
-        self.send_header("Content-Type", mime)
-        self.send_header("Content-Length", str(len(blob)))
-        self.send_header("Content-Disposition",
-                         "attachment; filename=\"report.docx\"; filename*=UTF-8''%s"
-                         % quote(filename))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(blob)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(blob)))
+            self.send_header("Content-Disposition",
+                             "attachment; filename=\"report.docx\"; filename*=UTF-8''%s"
+                             % quote(filename))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(blob)
+        except self._BROKEN:
+            self.close_connection = True
 
     def _body(self):
         try:
@@ -2431,7 +2442,11 @@ class Handler(SimpleHTTPRequestHandler):
             else:
                 self._json(api_stub(name, params))
         except Exception as e:
-            self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, 500)
+            # 兜底的 500 本身也可能写不出去（客户端已断），别让它再抛一次
+            try:
+                self._json({"ok": False, "error": "%s: %s" % (type(e).__name__, e)}, 500)
+            except Exception:
+                pass
         return True
 
     # --- 请求入口 ---
@@ -2444,7 +2459,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.path = parsed.path
         try:
             super().do_GET()
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
 
     def do_POST(self):
