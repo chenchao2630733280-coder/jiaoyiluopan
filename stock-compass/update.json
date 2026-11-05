@@ -1,0 +1,8 @@
+{
+  "_说明": "自动更新的配置。feedUrl 留空 = 不检查更新（默认，避免没服务器时每次启动都报错）。",
+  "_用法": "把 feedUrl 改成放 latest.json 的目录，例如 http://192.168.1.10:8099/ 或 https://your.site/compass/",
+  "enabled": true,
+  "feedUrl": "",
+  "checkOnStart": true,
+  "checkDelaySec": 10
+}

@@ -1,0 +1,67 @@
+{
+  "name": "rightside-compass-desktop",
+  "version": "1.0.0",
+  "description": "A股右侧交易罗盘 · 桌面客户端",
+  "main": "main.js",
+  "private": true,
+  "author": "AIPM",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win portable"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^26.18.0"
+  },
+  "build": {
+    "appId": "com.aipm.rightsidecompass",
+    "productName": "A股右侧交易罗盘",
+    "electronDist": "node_modules/electron/dist",
+    "directories": {
+      "output": "dist",
+      "buildResources": "."
+    },
+    "files": [
+      "main.js",
+      "package.json",
+      "icon.ico"
+    ],
+    "extraResources": [
+      {
+        "from": "..",
+        "to": "app",
+        "filter": [
+          "*.py",
+          "*.bat",
+          "index.html",
+          "manifest.webmanifest",
+          "update.json",
+          "assets/**/*",
+          "vendor/**/*",
+          "state/*.json",
+          "!__pycache__/**",
+          "!desktop/**",
+          "!data/**",
+          "!*.md",
+          "!*.png",
+          "!_*.html",
+          "!start.bat"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ],
+      "icon": "icon.ico"
+    },
+    "portable": {
+      "artifactName": "RightsideCompass-${version}-portable.exe",
+      "requestExecutionLevel": "user"
+    },
+    "compression": "maximum"
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "name": "A股右侧交易罗盘",
+  "short_name": "右侧罗盘",
+  "description": "右侧三位置 · 量价 · 缠论 · 主升浪 · 十二维个股体检 —— A股右侧交易决策工作台",
+  "lang": "zh-CN",
+  "dir": "ltr",
+  "start_url": "./?src=pwa",
+  "scope": "./",
+  "id": "rightside-compass",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "portrait-primary",
+  "background_color": "#0a0a0a",
+  "theme_color": "#0a0a0a",
+  "categories": ["finance", "productivity", "business"],
+  "icons": [
+    { "src": "/assets/pwa/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/assets/pwa/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/assets/pwa/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    {
+      "name": "右侧成熟度总榜",
+      "short_name": "总榜",
+      "description": "六池去重 · 综合得分排序",
+      "url": "./?src=pwa#rightside",
+      "icons": [{ "src": "/assets/pwa/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "自选盯盘",
+      "short_name": "自选",
+      "description": "实时行情 · 10 秒刷新",
+      "url": "./?src=pwa#watch",
+      "icons": [{ "src": "/assets/pwa/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "个股十二维体检",
+      "short_name": "十二维",
+      "description": "即时 · 位置/缠论/量价",
+      "url": "./?src=pwa#checkup",
+      "icons": [{ "src": "/assets/pwa/icon-192.png", "sizes": "192x192" }]
+    },
+    {
+      "name": "金石为开 · 沪金决策台",
+      "short_name": "沪金",
+      "description": "黄金交易专区 · 12维体检 · 持仓结构",
+      "url": "./?src=pwa#gold",
+      "icons": [{ "src": "/assets/pwa/icon-192.png", "sizes": "192x192" }]
+    }
+  ]
+}

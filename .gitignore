@@ -1,0 +1,36 @@
+# ---- 构建产物 / 依赖（本机合计约 1.9 GB，不该进仓库）----
+stock-compass/desktop/node_modules/
+stock-compass/desktop/dist/
+stock-compass/desktop/dist_*/
+stock-compass/desktop/dist-*/
+
+# ---- 行情缓存（可重新拉取，5223 个文件 / 83 MB）----
+stock-compass/data/kline/
+stock-compass/data/snapshot.json
+stock-compass/data/right_side.json
+stock-compass/data/strong.json
+
+# ---- 运行时状态（扫描结果、验证结果、日志）----
+stock-compass/state/
+stock-compass/罗盘数据/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 临时验证产物（截图、备份、探针脚本）----
+stock-compass/_*.png
+stock-compass/_*.html
+stock-compass/_*.js
+stock-compass/_*.py
+
+# ---- 系统 / 编辑器 ----
+Thumbs.db
+desktop.ini
+.DS_Store
+.idea/
+.vscode/
+*.log
