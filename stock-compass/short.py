@@ -1979,7 +1979,33 @@ def api_short(params):
     except Exception:
         sent = {}
 
-    streak_map = _streak_map(sent)
+    # ★ 日 K 与实时数据可能不在同一天：收盘后东财涨停池马上就能查到当天，
+    #   而日 K 要等数据源补当日那根（实测 15:08 时新浪指数日 K 还停在昨天）。
+    #   此时**不能**拿「今天的涨停池 + 昨天的日 K 特征」判涨停接力 ——
+    #   封单额是今天的、量比是昨天的，几个条件之间互相错位，判出来的票没意义。
+    #   整页统一退回日 K 口径，再把实时日期单独报出去，让页面能说清「为什么还是昨天」。
+    live_td = str(sent.get("trade_date") or "").replace("-", "")
+    kline_lag = bool(live_td and live_td != td)
+    kline_lag_err = ""
+    # 选股口径（同日池）：涨停候选必须与日 K 同一天，否则判定条件错位
+    sent_asof = sent
+    if kline_lag:
+        try:
+            # ★ 必须去掉横线：engine.latest_trade_date() 给的是 2026-11-04，
+            #   而东财涨停池接口吃 YYYYMMDD。传带横线的格式查回来是空池，
+            #   表现就是「涨停接力池 0 只」，看着像今天没有可接力的票。
+            zt_asof = server._fetch_pool("zt", str(td).replace("-", ""))
+            sent_asof = dict(sent)
+            sent_asof["pools"] = dict(sent.get("pools") or {})
+            sent_asof["pools"]["zt"] = [server._pool_row(r, "zt")
+                                        for r in (zt_asof.get("pool") or [])]
+        except Exception as e:
+            # 不静默：取不到同日涨停池时，涨停接力/龙头两个池会变 0，
+            # 页面必须能看出是「取数失败」还是「今天真没有」。
+            kline_lag_err = "%s: %s" % (type(e).__name__, e)
+            sent_asof = sent
+
+    streak_map = _streak_map(sent_asof)
     sec_diag = {}
     sectors = _sectors(streak_map, sec_diag)
     lhb = lhb_table(force=force)
@@ -1988,7 +2014,9 @@ def api_short(params):
     snap = engine.snapshot()
     snap_map = {str(r.get("code")): r for r in (snap.get("rows") or []) if r.get("code")}
 
-    pools, universe, diag = _collect(sent, sectors, snap_map, lhb_items)
+    # 选股走「同日口径」的 sent_asof；市场环境（指数/涨跌家数/涨停家数/梯队）
+    # 走实时 sent —— 温度就该反映此刻，而选股必须与日 K 同日，两者不能互相污染。
+    pools, universe, diag = _collect(sent_asof, sectors, snap_map, lhb_items)
     # 市场环境要报「MACD 底背离今日命中几只」，所以必须等池子先跑完 ——
     # 这个数字不是装饰，它是「今天有没有超跌反弹机会」的判断依据。
     div_cnt = next((p["scanned"] for p in pools if p["id"] == "divergence"), 0)
@@ -2000,13 +2028,30 @@ def api_short(params):
 
     total = sum(len(p["stocks"]) for p in pools)
     note = SHORT_NOTE
+
+    def _dash(s):
+        s = str(s or "")
+        return "%s-%s-%s" % (s[0:4], s[4:6], s[6:8]) if len(s) == 8 else (s or "--")
+
+    if kline_lag:
+        note += ("⚠ 日 K 尚未更新到 %s（数据源当日那根还没生成）：本页量价特征与板块强度"
+                 "（含板块内涨停家数）按 %s 收盘计算；指数、涨跌家数、全市场涨停家数为"
+                 "实时值（%s）。日 K 到位后本页会自动切到 %s。"
+                 % (_dash(live_td), _dash(td), _dash(live_td), _dash(live_td)))
+    if kline_lag_err:
+        note += "⚠ 同日涨停池取数失败（%s），涨停接力池与热点龙头池可能为空。" % kline_lag_err
     if universe["prefiltered"] > universe["kline_scanned"]:
         note += ("日 K 精算按当日成交额降序取了前 %d 只（快照层命中 %d 只）—— "
                  "成交额排序≈流动性排序，与「短线只做有量的票」同一条原则。"
                  % (universe["kline_scanned"], universe["prefiltered"]))
     out = {
         "ok": True, "empty": total == 0,
-        "trade_date": sent.get("trade_date") or td,
+        # 交易日必须是日 K 那一天：整页的量价特征都按它算出来的。
+        # 早先写的是 sent.get("trade_date")，情绪接口切成实时日后，
+        # 这里就会显示今天而数据还是昨天的 —— 比不更新更容易误导。
+        "trade_date": td,
+        "live_date": _dash(live_td) if live_td else "",
+        "kline_lag": kline_lag,
         "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
         "source": "东财涨停池 · 东财板块资金流 · 东财龙虎榜 · 本地量价引擎",
         "note": note,

@@ -6333,7 +6333,12 @@ function renderShort() {
   var _uTxt = _u.total
     ? (" · 全市场 " + _u.total + " 只 → 主板非ST<200亿 " + _u.prefiltered + " 只 → 日K精算 " + _u.kline_scanned + " 只")
     : "";
-  $("#shortMeta").textContent = "交易日 " + d.trade_date + " · 数据来源 " + (d.source || "通达信") + _uTxt + " · 更新于 " + d.updated;
+  // 日K还没更新到实时日时把原因写在元信息里：否则用户只看到「交易日 昨天」，
+  // 会以为是拉取失败了。这里的口径是「量价特征算到哪一天」，不是「今天几号」。
+  var _lagTxt = (d.kline_lag && d.live_date)
+    ? (" · ⚠ 日K待更新（实时已到 " + d.live_date + "，量价特征仍按 " + d.trade_date + " 收盘）")
+    : "";
+  $("#shortMeta").textContent = "交易日 " + d.trade_date + " · 数据来源 " + (d.source || "通达信") + _uTxt + _lagTxt + " · 更新于 " + d.updated;
 
 
 

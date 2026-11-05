@@ -448,9 +448,34 @@ def _promote_rate(trade_date):
 
 
 def latest_trade_date():
-    """最近一个交易日（YYYYMMDD）。用上证指数日线最后一条判定，最可靠。"""
+    """最近一个「实时」交易日（YYYYMMDD）：取腾讯指数行情的最后成交时点。
 
+    ★ 这个函数**不是** engine.latest_trade_date() 的同义词，两者不能互相替换：
+      · engine 那个是「日 K 口径」—— 日 K 拍到哪天就返回哪天，供 ensure_klines
+        与各榜单做缓存键，必须与磁盘上的日 K 严格一致；
+      · 这个是「实时口径」—— 盘中/收盘后立即反映今天，供情绪页查涨停池。
+      收盘后两者会差几分钟到几十分钟：2026-11-05 15:08 实测，新浪 sh000001
+      日 K 最后一条仍是 11-04（当日那根还没生成），而腾讯 [30] 已是
+      20261105150900、东财涨停池 20261105 也已经有 84 只。
+      早先这里也读新浪日 K，结果情绪页把**今天的涨停池查成昨天的** ——
+      涨跌家数、指数是实时的，涨停家数是昨天的，一张页面混两套口径，
+      看上去就像「数据没更新」。
+
+    ★ 腾讯 [30] 的语义是「最后成交时点」，非交易日会保留上一交易日的时间戳，
+      所以周末/节假日调它得到的仍是最近交易日，不用再维护交易日历。
+    """
     def load():
+        try:
+            arr = tx_raw(["sh000001"]).get("sh000001")
+            stamp = str(arr[30]) if arr and len(arr) > 30 else ""
+            if len(stamp) >= 8 and stamp[:8].isdigit():
+                d = stamp[:8]
+                # 防御：字段异常跳到未来时不能信，宁可回退到日 K
+                if d <= time.strftime("%Y%m%d"):
+                    return d
+        except Exception:
+            pass
+        # 兜底：新浪指数日 K 最后一根（腾讯不可达/字段异常时）
         url = ("https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/"
                "CN_MarketData.getKLineData?symbol=sh000001&scale=240&ma=no&datalen=5")
         try:
@@ -461,7 +486,8 @@ def latest_trade_date():
             pass
         return time.strftime("%Y%m%d")
 
-    return cached("trade_date", 300, load)
+    # TTL 60s：收盘那一刻就要能切到当天，别再沿用 300s 把错日期多挂 5 分钟
+    return cached("trade_date_live", 60, load)
 
 
 def api_sentiment(params):
