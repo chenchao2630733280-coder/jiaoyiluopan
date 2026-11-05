@@ -840,7 +840,10 @@ def _make_plan(rows, f, bo):
         sell += "；已过突破窗口，不新开仓"
 
     return {
-        "buy_zone": "%.2f ~ %.2f" % (round(lo, 2), round(hi, 2)),
+        # 买点必须写明基准日：卡片上的价格是实时行情，这个区间是按最后一根收盘 K 线算的，
+        # 盘中跌下去以后「现价」会低于买点下沿，不标基准日会被误读成区间失效。
+        "buy_zone": "%.2f ~ %.2f（按 %s 收盘）" % (
+            round(lo, 2), round(hi, 2), f.get("date") or "上一交易日"),
         "stop_loss": round(stop, 2),
         "stop_pct": round((stop / close - 1) * 100, 1),
         "target1": round(t1, 2),
