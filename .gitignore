@@ -29,6 +29,7 @@ stock-compass/_*.html
 stock-compass/_*.js
 stock-compass/_*.py
 stock-compass/_*.json
+stock-compass/_*.txt
 
 # ---- 系统 / 编辑器 ----
 Thumbs.db

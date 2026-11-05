@@ -839,11 +839,14 @@ def _make_plan(rows, f, bo):
     elif ph in ("过窗", "失守"):
         sell += "；已过突破窗口，不新开仓"
 
+    # 写明基准日：卡片上的价格是实时行情，计划是按最后一根收盘 K 线算的，
+    # 盘中跌下去以后「现价」会低于买点下沿，不标基准日会被误读成区间失效。
+    sell = "计划按 %s 收盘测算；%s" % (str(f.get("date") or "上一交易日")[-5:], sell)
+
     return {
-        # 买点必须写明基准日：卡片上的价格是实时行情，这个区间是按最后一根收盘 K 线算的，
-        # 盘中跌下去以后「现价」会低于买点下沿，不标基准日会被误读成区间失效。
-        "buy_zone": "%.2f ~ %.2f（按 %s 收盘）" % (
-            round(lo, 2), round(hi, 2), f.get("date") or "上一交易日"),
+        # 基准日不放买点格里：那一格宽度只够 ~24 个字符，带上日期必然折成两行，
+        # 整行高度跟着变。挪到下面整行的卖出信号前面，信息不丢、排版不歪。
+        "buy_zone": "%.2f ~ %.2f" % (round(lo, 2), round(hi, 2)),
         "stop_loss": round(stop, 2),
         "stop_pct": round((stop / close - 1) * 100, 1),
         "target1": round(t1, 2),
@@ -1087,7 +1090,12 @@ def _collect(lhb_items):
             st["board"] = (snap_map.get(st["code"]) or {}).get("board")
         if not ctx:
             st["bo"] = None
-            st["plan"] = {}
+            # 前端 pi() 用 `val || "—"` 兜底，但 esc(undefined) 先变成字符串 "undefined"
+            # （真值），所以必须给完整空壳，不能只给 {}。
+            st["plan"] = {"buy_zone": "", "stop_loss": None, "stop_pct": None,
+                          "target1": None, "target2": None,
+                          "position": "", "hold": "",
+                          "sell_signal": "K 线不足 30 根，不给交易计划"}
             st["reason"] = "K 线不足 30 根，无法给出交易计划"
             st["tags"] = []
             # 次新股常常没有 30 根 K 线，但快照里有当天的价格与涨幅，
