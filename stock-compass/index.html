@@ -6327,7 +6327,13 @@ function renderShort() {
 
   shCalcDist();      // 体检/缠论全局分布，供各池筛选条上的数字（2026-10-04 增）
 
-  $("#shortMeta").textContent = "交易日 " + d.trade_date + " · 数据来源 " + (d.source || "通达信") + " · 更新于 " + d.updated;
+  /* 选股范围要写在标题行：这张表只覆盖「主板 60/00 · 非ST · 总市值<200亿」，
+     不写清楚就会被当成「全市场扫描没找到好票」，判断完全走偏。 */
+  var _u = d.universe || {};
+  var _uTxt = _u.total
+    ? (" · 全市场 " + _u.total + " 只 → 主板非ST<200亿 " + _u.prefiltered + " 只 → 日K精算 " + _u.kline_scanned + " 只")
+    : "";
+  $("#shortMeta").textContent = "交易日 " + d.trade_date + " · 数据来源 " + (d.source || "通达信") + _uTxt + " · 更新于 " + d.updated;
 
 
 
@@ -6338,6 +6344,8 @@ function renderShort() {
     (me.rules || []).map(function (r) { return '<span class="sector-chip">' + esc(r) + '</span>'; }).join("") +
 
     '<div class="note" style="margin-top:10px">' +
+
+    (d.vp_note ? '<div class="note" style="margin-top:8px">' + esc(d.vp_note) + '</div>' : '') +
 
     (me.sources || []).map(function (s) {
 
@@ -6505,6 +6513,21 @@ function renderShort() {
     };
   }
 
+  /* 判定异常提示条：pools_note 非空意味着「某个池的 0 只命中是代码问题，不是行情
+     结论」。这种情况必须显眼地说出来，否则会被当成「今天没有机会」而错过排查。 */
+  var oldPn = document.getElementById("shortPoolsNote");
+  if (oldPn) oldPn.remove();
+  if (d.pools_note) {
+    var pn = document.createElement("div");
+    pn.id = "shortPoolsNote";
+    pn.className = "notebox";
+    pn.style.cssText += ";margin-top:10px;border-color:var(--up);color:var(--dn)";
+    pn.innerHTML = '<b>⚠ 部分标的判定异常</b><span class="mut">' + esc(d.pools_note) +
+      '。对应池子的数量可能偏少，别把它当成行情结论。</span>';
+    var anchorPn = document.getElementById("shortPoolTabs");
+    if (anchorPn && anchorPn.parentNode) anchorPn.parentNode.insertBefore(pn, anchorPn);
+  }
+
   var pools = d.pools || [];
   var total = pools.reduce(function (n, p) { return n + p.stocks.length; }, 0);
 
@@ -6537,6 +6560,8 @@ function renderShort() {
   $("#shortDiscipline").innerHTML =
 
     (d.discipline || []).map(function (x) { return '<div class="disc-item">' + esc(x) + '</div>'; }).join("") +
+
+    (d.note ? '<div class="note" style="margin-top:11px">' + esc(d.note) + '</div>' : '') +
 
     '<div class="note" style="margin-top:11px">' + esc(d.disclaimer || "") + '</div>';
 

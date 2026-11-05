@@ -28,8 +28,6 @@ STORE_DIR = os.environ.get("COMPASS_STORE") or engine.BASE_DIR
 DATA_DIR = os.path.join(STORE_DIR, "data")
 LHB_FILE = os.path.join(DATA_DIR, "lhb.json")
 
-POOL_MAX = 40          # 单池最多展示多少只（再多前端也读不完）
-TOTAL_MAX = 130        # 跨池去重后的总标的数上限，决定体检/突破窗口的计算量
 PAYLOAD_TTL = 60       # 整包缓存秒数
 
 _EM_API = "https://datacenter-web.eastmoney.com/api/data/v1/get"
@@ -433,7 +431,24 @@ def bo_of(rows):
 # ---------------------------------------------------------------------------
 # 四、主线板块（东财行业板块 + 成分股）
 # ---------------------------------------------------------------------------
-SECTOR_N = 6
+SECTOR_N = 8           # 展示板块数的上限（与原站一致）：是「最多 8 行」，
+                       # 不是「必须 8 行」—— 独立板块不够时宁可少一行，不重复凑数
+
+# 板块成分要判定「是否属于可交易范围」，口径必须与 universe 完全一致：
+# 主板 60/00 · 非 ST · 总市值 < 200 亿。否则「N 只 · 涨停 X 家」会把
+# 创业板/科创板/北交所的票算进来，跟「只做主板」的池子对不上号。
+UNI_MV_MAX = 200.0
+
+
+def _in_universe(row):
+    code = str(row.get("f12") or "")
+    if code[:2] not in ("60", "00"):
+        return False
+    if engine.is_st(row.get("f14") or ""):
+        return False
+    mv_yi = float(row.get("f20") or 0) / 1e8     # f20 = 总市值（元）
+    return 0 < mv_yi < UNI_MV_MAX
+
 
 def _limit_pct(code):
     """涨停判定阈值：创业板/科创板 20%，北交所 30%，其余 10%。
@@ -456,35 +471,61 @@ def _board_members(bk, total):
     1) 不翻页 —— 电力设备有 409 只成分，只拿到按涨幅降序的前 100 只，
        涨停占比被放大 3~4 倍、中位涨幅被抬到 7%（真实 2.8%）；
     2) 中途放弃 —— 东财 push2 在并发下会 RemoteDisconnected，以前一失败就
-       break，得到「看起来很完整的 100 行」。现在每页单独重试，且返回
-       是否取全，交给调用方决定要不要标注。
+       break，得到「看起来很完整的 100 行」。
+
+    实现上先按 total 算出页数，**页与页并发**抓；某页空就串行补抓（最多 3 次）。
+    串行 5 页要 2 秒，并发只要 0.6 秒，8 个板块串起来就是十几秒的差别。
 
     返回 (rows, complete)。
     """
-    rows, page, size = [], 1, 100
-    want = min(total or size, 800)     # 真实上限：电子 512 只，别自作主张截断
-    misses = 0
-    while len(rows) < want and page <= 8:
-        batch = []
-        for t in range(3):             # 每页最多试 3 次，退避 0.3/0.6s
+    size = 100
+    want = min(total or size, 800)          # 真实上限：电子 512 只，别自作主张截断
+    npages = max(1, min(int((want + size - 1) // size), 8))
+
+    def page(pn):
+        for t in range(3):
             d = _push("pn=%d&pz=%d&po=1&np=1&fltt=2&invt=2&fid=f3&fs=b:%s"
-                      "&fields=f12,f14,f3,f2" % (page, size, bk), tries=1)
+                      "&fields=f12,f14,f3,f2,f20" % (pn, size, bk), tries=1)
             batch = ((d.get("data") or {}).get("diff") or [])
             if batch:
-                break
-            time.sleep(0.3 * (t + 1))
-        if not batch:
-            misses += 1
-            if misses >= 2:            # 连着两页空 → 认输，但标记不完整
-                break
-            page += 1
-            continue
-        rows.extend(batch)
-        if len(batch) < size:
-            break
-        page += 1
-    rows = [x for x in rows if x.get("f3") not in (None, "-")]
-    complete = (not want) or len(rows) >= min(want, total or want) * 0.95
+                return pn, batch
+            time.sleep(0.25 * (t + 1))
+        return pn, []
+
+    results = {}
+    if npages == 1:
+        results[1] = page(1)[1]
+    else:
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            for pn, batch in ex.map(page, range(1, npages + 1)):
+                results[pn] = batch
+        # 并发偶发断连时，只补真的空了的页，并且串行补 —— 慢一点但正确
+        for pn in [i for i in range(1, npages + 1) if not results.get(pn)]:
+            results[pn] = page(pn)[1]
+
+    def collect(res):
+        out = []
+        for pn in sorted(res):
+            out.extend(res[pn])
+        return [x for x in out if x.get("f3") not in (None, "-")]
+
+    rows = collect(results)
+    need = min(want, total or want)
+
+    # 并发抓不齐时做一次「整块串行重抓」：东财在乱序并发下会固定让某一页返回空，
+    # 而同样的页在串行请求里是好的。只有取不齐的板块才会走到这里（实测占比很小），
+    # 所以这一次额外开销值得 —— 电力设备 411 只只拿到 312 只时，中位涨幅与
+    # 涨停占比都会失真，强度排名跟着歪。
+    if total and total >= 100 and len(rows) < need * 0.95:
+        seq = {}
+        for pn in range(1, npages + 1):
+            seq[pn] = page(pn)[1]
+            time.sleep(0.12)
+        alt = collect(seq)
+        if len(alt) > len(rows):
+            rows = alt
+
+    complete = (not want) or len(rows) >= need * 0.95
     return rows, complete
 
 
@@ -504,18 +545,30 @@ def _sectors(streak_map, diag=None):
         return []
 
     q = ("pn=1&pz=%d&po=1&np=1&fltt=2&invt=2&fid=f62&fs=m:90+t:2+f:!50"
-         "&fields=f12,f14,f3,f62,f104,f105,f128,f136" % (SECTOR_N * 3))
+         "&fields=f12,f14,f3,f62,f104,f105,f128,f136" % (SECTOR_N + 22))
     d = _push(q)
     boards = ((d.get("data") or {}).get("diff") or [])
     if not boards:
         return _fail("板块列表接口无返回（%s）" % (_NET["last"] or "未知原因"))
 
-    cands = boards[:SECTOR_N * 3]
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futs = {b.get("f12"): ex.submit(_board_members, b.get("f12"),
-                                        int(b.get("f104") or 0) + int(b.get("f105") or 0))
-                for b in cands if b.get("f12")}
+    # 候选要留够：东财资金流榜前几名的父子板块极密（半导体/半导体设备/半导体材料、
+    # 传媒/营销代理/广告营销、电池/锂电池…），去重之后 14 个候选只剩 6 个独立板块。
+    # 留 14 个余量才凑得满 8 行；再多就只是徒增请求，耗时线性上涨。
+    cands = boards[:SECTOR_N + 14]
+    totals = {b.get("f12"): int(b.get("f104") or 0) + int(b.get("f105") or 0)
+              for b in cands if b.get("f12")}
+
+    # ★ 并发只用来省时间，正确性不能交给它：实测 4 路并发拉成分时，东财会偶发
+    #   RemoteDisconnected，返回「看着完整的半份数据」（电力设备 412 只只拿到
+    #   200 只），强度排名随之在 63 与 70 之间抖动，板块分级一会儿「次主线」
+    #   一会儿「主线」。所以并发只跑第一轮，没取全的板块串行补抓一次 ——
+    #   单跑一次 2 秒，8 个板块全补也就十几秒，比排名不稳好得多。
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futs = {bk: ex.submit(_board_members, bk, totals.get(bk)) for bk in totals}
         members = {k: f.result() for k, f in futs.items()}
+    for bk, (rows, ok) in list(members.items()):
+        if not ok or not rows:
+            members[bk] = _board_members(bk, totals.get(bk))
 
     out, kept_sets = [], []
     for b in cands:
@@ -561,11 +614,19 @@ def _sectors(streak_map, diag=None):
 
         strength = round(cap(med, 5.0) * 0.30 + cap(premium, 10.0) * 0.20 +
                          cap(zt_ratio, 0.15) * 0.30 + cap(net_yi + 10, 50.0) * 0.20, 1)
-        grade = ("主线" if strength >= 70 else "次线" if strength >= 55
-                 else "观察" if strength >= 40 else "退潮")
+        # 分级用原站的五个词：主线 / 次主线 / 普涨 / 轮动 / 退潮。
+        # 阈值跟着强度分档走，70 以上才算主线 —— 这样「主线」稀缺，
+        # 页面上看到「主线」两个字才知道今天真只有一条线。
+        grade = ("主线" if strength >= 70 else "次主线" if strength >= 55
+                 else "普涨" if strength >= 45 else "轮动" if strength >= 35 else "退潮")
+
+        # n / zt_cnt 只统计 universe 内的票（主板·非ST·<200亿）：这两个数是给
+        # 「这个板块里我能买几只、有几只涨停」看的，混进 20cm 的票就失去意义。
+        uni = [x for x in rows if _in_universe(x)]
+        base = uni or rows
 
         ladder = []
-        for i, x in enumerate(rows[:5]):
+        for i, x in enumerate(base[:5]):
             code = str(x.get("f12") or "")
             st = streak_map.get(code) or 0
             if st >= 2:
@@ -585,7 +646,9 @@ def _sectors(streak_map, diag=None):
         kept_sets.append(codes)
         out.append({
             "name": name, "code": bk, "strength": strength, "grade": grade,
-            "n": len(rows), "zt_cnt": len(zt),
+            "n": len(base),
+            "zt_cnt": sum(1 for x in base
+                          if float(x.get("f3") or 0) >= _limit_pct(str(x.get("f12") or ""))),
             "partial": not complete,       # 成分没取全时标注，别让 n 看着像全量
             "main_net_yi": round(net_yi, 2), "median_pct": round(med, 2), "lead_pct": round(lead_pct, 2),
             "up": b.get("f104"), "down": b.get("f105"),
@@ -618,11 +681,94 @@ def _streak_map(sent):
     return m
 
 
-def _market(sent, sectors):
+CYCLE = [
+    ("ice", "冰点"), ("start", "启动"), ("ferment", "发酵"),
+    ("speed", "加速"), ("climax", "高潮"), ("ebb", "退潮"),
+]
+CYCLE_NAME = dict(CYCLE)
+
+# 六阶段的操作含义（《游资交易体系——21 天突破》口径）：
+# 阶段不是标签，它直接换算成仓位闸门 —— 这是本页唯一一处「环境决定仓位」的地方。
+CYCLE_NOTE = {
+    "ice": "涨停稀少、连板断层，冰点期只能试错首板且必须轻仓",
+    "start": "赚钱效应刚回暖、连板开始接上，试错成本下降但高标尚未确认",
+    "ferment": "梯队成型，是主升参与的黄金窗口，可加仓核心标的",
+    "speed": "家数与高度同步扩张，只做龙头不追跟风，盯紧炸板率是否抬头",
+    "climax": "家数与高度同时见顶，只减不加 —— 让别人来接，不是自己接",
+    "ebb": "炸板率高于封板、连板断层，一律不接力，空仓等冰点",
+}
+
+# 阶段 → (仓位文案, 总仓上限%, 单池仓位上限%)
+CYCLE_POS = {
+    "ice": ("0-2 成", 2, 1),
+    "start": ("2-3 成", 3, 1),
+    "ferment": ("4-6 成", 6, 2),
+    "speed": ("5-7 成", 7, 2),
+    "climax": ("5-7 成（只减不加）", 7, 2),
+    "ebb": ("0-2 成", 2, 1),
+}
+
+CYCLE_LEVEL = {"ice": "warn", "ebb": "warn", "start": "neu",
+               "ferment": "good", "speed": "good", "climax": "neu"}
+
+
+def _cycle_of(zt, mx, zb_rate):
+    """涨停家数 + 连板高度 + 炸板率 → 情绪周期六阶段。
+
+    ★ 阈值写死在这里而不是分散在各处，是为了让「为什么今天报发酵」可以
+      拿三个数字当场复算：79 家 / 3 板 / 炸板 44% → 发酵。
+      顺序也有讲究：先判冰点（家数太少谈不上任何阶段），再判退潮（炸板率
+      高且家数没起来），最后才按家数+高度逐档升。
+    """
+    if zt < 15:
+        return "ice"
+    if zb_rate is not None and zb_rate >= 45 and zt < 40:
+        return "ebb"
+    if zt >= 100 and mx >= 5:
+        return "climax"
+    if zt >= 80 and mx >= 4:
+        return "speed"
+    if zt >= 50 and mx >= 3:
+        return "ferment"
+    if zt >= 30:
+        return "start"
+    return "ebb" if (zb_rate or 0) >= 40 else "start"
+
+
+def _cycle_heat(zt, mx, seal, up_ratio):
+    """情绪热度 0~100：涨停家数 30 + 连板高度 25 + 封板率 25 + 市场广度 20。"""
+    h = min(zt / 100.0, 1.0) * 30.0
+    h += min(mx / 6.0, 1.0) * 25.0
+    h += (max(0.0, min(100.0, seal if seal is not None else 60)) / 100.0) * 25.0
+    h += (max(0.0, min(100.0, up_ratio if up_ratio is not None else 50)) / 100.0) * 20.0
+    return round(h, 1)
+
+
+def _ladder_text(zt_rows):
+    """涨停梯队文案：N板 X 家，从高到低。"""
+    m = {}
+    for r in zt_rows:
+        if not isinstance(r, dict):
+            continue
+        k = int(r.get("streak") or 1)
+        m[k] = m.get(k, 0) + 1
+    if not m:
+        return "--"
+    return " · ".join("%d板 %d 家" % (k, m[k]) for k in sorted(m, reverse=True))
+
+
+def _market(sent, sectors, div_cnt=0):
+    """市场环境：情绪周期定位 + 仓位闸门 + 五条信号灯。
+
+    前端 renderShort 读的是 m.phase / phase_level / read / index_summary /
+    breadth / limit_summary / advice{position,focus,avoid,tactics} /
+    signals[{k,v,level}] —— 字段名一个都不能改。
+    """
     idx = (sent or {}).get("indices") or []
     bd = (sent or {}).get("breadth") or {}
     lim = (sent or {}).get("limit") or {}
     temp = (sent or {}).get("temperature") or {}
+    zt_rows = ((sent or {}).get("pools") or {}).get("zt") or []
 
     zt = int(lim.get("zt") or 0)
     dt = int(lim.get("dt") or 0)
@@ -630,88 +776,756 @@ def _market(sent, sectors):
     seal = lim.get("seal_rate")
     mx = int(lim.get("max_streak") or 0)
     up, down = bd.get("up"), bd.get("down")
-    up_ratio = round(up / float(up + down) * 100, 1) if up and down else None
+    up_ratio = round(up / float(up + down) * 100, 1) if (up and down) else None
+    zb_rate = round(zb / float(zt + zb) * 100, 1) if (zt + zb) else None
 
-    # 情绪分档：用涨停家数 + 封板率 + 涨跌家数三项定档，阈值写死在这里便于复算
-    score = 0
-    if zt >= 80:
-        score += 2
-    elif zt >= 45:
-        score += 1
-    elif zt <= 20:
-        score -= 1
-    if dt >= 30:
-        score -= 2
-    elif dt >= 10:
-        score -= 1
-    if seal is not None:
-        if seal >= 75:
-            score += 1
-        elif seal < 55:
-            score -= 1
+    key = _cycle_of(zt, mx, zb_rate)
+    name = CYCLE_NAME[key]
+    heat = _cycle_heat(zt, mx, seal, up_ratio)
+    pos_txt, pos_num, pool_cap = CYCLE_POS[key]
+    note = CYCLE_NOTE[key]
+
+    idx_txt = " · ".join("%s %.2f（%.2f%%）" % (i.get("name"), i.get("price") or 0,
+                                              i.get("pct") or 0) for i in idx[:3])
+    if not idx_txt:
+        idx_txt = "指数数据缺失"
     if up_ratio is not None:
-        if up_ratio >= 65:
-            score += 1
-        elif up_ratio <= 35:
-            score -= 1
-
-    if score >= 4:
-        phase, level = "普涨 · 情绪高潮", "强势"
-    elif score >= 2:
-        phase, level = "偏暖 · 结构活跃", "偏暖"
-    elif score >= -1:
-        phase, level = "震荡 · 轮动分化", "中性"
-    elif score >= -3:
-        phase, level = "偏弱 · 赚钱效应差", "偏弱"
+        breadth_txt = "上涨 %d 家 / 下跌 %d 家（%s）" % (
+            up, down, "涨多于跌" if up > down else ("跌多于涨" if down > up else "涨跌持平"))
     else:
-        phase, level = "普跌 · 情绪冰点", "冰点"
+        breadth_txt = "市场宽度数据缺失"
 
-    pos = {2: "7 成以内", 1: "5 成以内", 0: "3~5 成", -1: "2~3 成", -2: "空仓或试错"}[max(-2, min(2, score))]
-    idx_txt = " · ".join("%s %+.2f%%" % (i.get("name"), i.get("pct") or 0) for i in idx[:3]) or "指数数据缺失"
-    breadth_txt = ("上涨 %s / 下跌 %s（上涨占比 %.1f%%）" % (up, down, up_ratio)) if up_ratio is not None else "市场宽度数据缺失"
-    limit_txt = "涨停 %d · 跌停 %d · 炸板 %d" % (zt, dt, zb)
-    if seal is not None:
-        limit_txt += "（封板率 %.1f%%）" % seal
-    if mx:
-        limit_txt += " · 最高 %d 连板" % mx
+    limit_txt = "涨停 %d 家 · 最高 %d 连板 · 炸板 %d 家" % (zt, mx, zb)
+    if zb_rate is not None:
+        limit_txt += "（%.0f%%）" % zb_rate
 
-    hot = [s["name"] for s in (sectors or [])[:2]]
-    focus = ("主线：%s" % "、".join(hot)) if hot else "板块强度不足，无明确主线"
-    if dt >= 25:
-        avoid = "跌停 %d 家，退潮期一律不接力" % dt
-    elif zb >= 30:
-        avoid = "炸板 %d 家，封不住的高位板不碰" % zb
+    top = (sectors or [{}])[0] if sectors else {}
+    if top.get("name"):
+        top_txt = "%s（强度 %.1f · %s · %d 只涨停 / 主力净流入 %+.2f 亿）" % (
+            top["name"], top.get("strength") or 0, top.get("grade") or "",
+            top.get("zt_cnt") or 0, top.get("main_net_yi") or 0)
+        focus = ("紧跟当日最强主线（%s），只做主线龙头与强势突破，宁可错过不做跟风补涨。"
+                 % top["name"])
     else:
-        avoid = "回避位置1（追高）与破位股"
+        top_txt = "板块强度数据缺失"
+        focus = "板块层无有效数据，今日以情绪周期定仓位、不做板块内的接力。"
 
-    read = "情绪%s（%s）；%s。仓位上限 %s。" % (
-        level, phase.split(" · ")[-1] if " · " in phase else phase, limit_txt, pos)
+    read = "情绪处于【%s】期：涨停 %d 家、最高 %d 板、炸板率 %s，主线在 %s。%s。" % (
+        name, zt, mx, ("%.0f%%" % zb_rate) if zb_rate is not None else "--", top_txt, note)
+
+    if mx >= 4:
+        avoid = ("① %d 板以上高位连板高标 —— 只作情绪标杆；② 放量破位的「伪回踩」股；"
+                 "③ 无题材支撑的缩量阴跌股。" % max(4, mx - 1))
+    else:
+        avoid = ("① 4 板以上高位连板高标（今日最高 %d 板，尚未出现）—— 只作情绪标杆；"
+                 "② 放量破位的「伪回踩」股；③ 无题材支撑的缩量阴跌股。" % mx)
 
     signals = [
-        {"k": "涨停 / 跌停", "v": "%d / %d" % (zt, dt), "level": "good" if zt > dt * 3 else ("warn" if dt > zt else "neu")},
-        {"k": "封板率", "v": ("%.1f%%" % seal) if seal is not None else "--",
-         "level": "good" if (seal or 0) >= 70 else ("warn" if (seal or 100) < 55 else "neu")},
-        {"k": "市场宽度", "v": breadth_txt, "level": "good" if (up_ratio or 0) >= 60 else ("warn" if (up_ratio or 100) <= 40 else "neu")},
-        {"k": "最高连板", "v": "%d 板" % mx if mx else "--", "level": "good" if mx >= 4 else "neu"},
-        {"k": "情绪温度", "v": ("%.1f（%s）" % (temp.get("score"), temp.get("label"))) if temp.get("score") is not None else "--", "level": "neu"},
+        {"k": "情绪周期", "level": CYCLE_LEVEL.get(key, "neu"),
+         "v": "【%s】涨停 %d 家、连板高度 %d：%s。" % (name, zt, mx, note)},
+        {"k": "涨停梯队", "level": "good" if mx >= 3 else ("warn" if mx <= 1 else "neu"),
+         "v": _ladder_text(zt_rows)},
+        {"k": "主线板块", "level": "good" if top.get("strength", 0) >= 55 else "neu",
+         "v": top_txt},
+        {"k": "仓位闸门", "level": CYCLE_LEVEL.get(key, "neu"),
+         "v": "%s —— %s期，%s" % (pos_txt, name, note)},
+        {"k": "MACD 底背离", "level": "good" if div_cnt else "neu",
+         "v": ("今日命中 %d 只 —— 存在超跌反弹机会" % div_cnt) if div_cnt
+              else "今日 0 只命中 —— 超跌反弹条件未成立"},
     ]
 
-    tactics = ("只做首启与验证期，末窗只减不加" if score >= 2
-               else "轻仓试错，只做最强主线的一进二" if score >= -1
-               else "空仓等待，等跌停潮过去再看首板")
+    tactics = ("10:00 前不追高；优先等回踩 5 日线低吸；若高标开板炸板，立即同步降低其他仓位。"
+               if key in ("ferment", "speed", "climax") else
+               "只做首板试错，不碰连板接力；单票不超过 1 成，错了当天就走。")
 
     return {
-        "phase": phase, "phase_level": level, "read": read,
-        "index_summary": idx_txt, "breadth": breadth_txt, "limit_summary": limit_txt,
+        "phase": "情绪周期 · %s" % name,
+        "phase_level": name,
+        "temperature": temp.get("score"),
+        "index_summary": idx_txt,
+        "breadth": breadth_txt,
+        "limit_summary": limit_txt,
+        "cycle_key": key,
+        "cycle_heat": heat,
+        "read": read,
+        "advice": {
+            "position": pos_txt,
+            "position_num": pos_num,
+            "pool_pos_cap": pool_cap,
+            "position_note": "%s期，%s" % (name, note),
+            "focus": focus,
+            "avoid": avoid,
+            "tactics": tactics,
+        },
         "signals": signals,
-        "advice": {"position": pos, "focus": focus, "avoid": avoid, "tactics": tactics},
-        "score": score,
+        "score": "%.1f" % heat,
     }
 
 
 # ---------------------------------------------------------------------------
-# 六、六个池
+# 五之二、选股范围（universe）
 # ---------------------------------------------------------------------------
+
+KLINE_SCAN_MAX = 1800     # 日 K 精算的硬上限，按当日成交额降序取
+
+
+def _universe(snap_map):
+    """选股范围：沪深主板（60/00）· 非 ST · 总市值 < 200 亿。
+
+    ★ 这是用户 2026-10-04 的决定 —— 不放开创业板/科创板。理由不是歧视，
+      是纪律：20cm 的日常波动本身就吃掉 -5% 止损，同一套止损规则在两种
+      涨跌幅制度下不等价。北交所 30cm 同理。
+
+    返回 (全市场家数, 通过快照过滤的快照行)。
+    """
+    total = len(snap_map)
+    pre = []
+    for r in snap_map.values():
+        code = str(r.get("code") or "")
+        if code[:2] not in ("60", "00"):
+            continue
+        if engine.is_st(r.get("name") or ""):
+            continue
+        if not (r.get("price") or 0) > 0:
+            continue
+        mv = r.get("mv_yi") or 0
+        # 市值未知的一律不进：放进来等于把「不知道多大」当成「足够小」，
+        # 结果就是大盘股混进短线池，这比池子小一圈更糟。
+        if mv <= 0 or mv >= UNI_MV_MAX:
+            continue
+        pre.append(r)
+    return total, pre
+
+
+# ---------------------------------------------------------------------------
+# 六、六个池（口径对齐原站战法池）
+# ---------------------------------------------------------------------------
+#
+# 池的 id / 顺序 / 风险等级与原站一一对应：
+#   ① breakout   突破池       normal
+#   ② limit_up   涨停接力池   normal
+#   ③ leader     热点龙头池   normal
+#   ④ gap        缺口池       normal
+#   ⑤ pullback   回踩观察池   warn
+#   ⑥ divergence 底背离池     warn
+#
+# scan 字段是从原站接口原样抄下来的条件文本 —— 它是这个池的「合同」，
+# 代码必须逐条兑现；改条件时两处一起改，否则页面上写的和跑的不是一回事。
+
+POOL_DEFS = [
+    {
+        "id": "breakout", "icon": "①", "name": "突破池", "risk": "normal",
+        "book_ref": "《短线操盘实战技法》第 2 章 · 高低点突破买入法",
+        "logic": "放量突破近 20 日高点 + MA5>MA10>MA20 多头排列，"
+                 "回踩 5 日线低吸，跌破 10 日线止损。",
+        "scan": "全市场主板（60/00·非ST·市值<200亿）→ 快照粗筛涨幅 1%~9.6% 且换手≥1.5% → "
+                "日K 精算：收盘≥20日最高 ∧ MA5>MA10>MA20 ∧ 量比≥1.15 ∧ 量比5/20≤4 ∧ 250日位置≤92%",
+    },
+    {
+        "id": "limit_up", "icon": "②", "name": "涨停接力池", "risk": "normal",
+        "book_ref": "《短线操盘实战技法》第 6 章 · 强势涨停突破买入法",
+        "logic": "今日涨停且封板质量合格（未反复炸板、封成比≥1%）；"
+                 "次日竞价高开 0~3% 接力，开板即走。",
+        "scan": "东财涨停池（getTopicZTPool）→ 主板过滤 → 炸板次数<2 ∧ 封单额/流通市值≥1% "
+                "→ 按 连板数+封成比+换手 排序",
+    },
+    {
+        "id": "leader", "icon": "③", "name": "热点龙头池", "risk": "normal",
+        "book_ref": "《游资全景看盘之板块轮动擒龙头》· 主线辨识 + 龙头溢价",
+        "logic": "只在当日强势板块（前 6）里取板块内梯队前 3 的票；"
+                 "4 板以上或梯队第 3 位之后只作情绪标杆。",
+        "scan": "板块层强度排名前 6 的板块 → 取各板块梯队 ladder 前 3 位 "
+                "→ 按 板块排名+梯队位次+连板高度 排序",
+    },
+    {
+        "id": "gap", "icon": "④", "name": "缺口池", "risk": "normal",
+        "book_ref": "《短线操盘实战技法》第 5 章 · 缺口追涨与支撑买入法",
+        "logic": "向上跳空缺口（今日最低>昨日最高，或近 5 日内出现且至今未回补）+ 量能配合；"
+                 "缺口下沿即止损锚点，回补即走。",
+        "scan": "日K 精算：（今日最低>昨日最高 ∨ 近5日有向上缺口且收盘仍>缺口下沿）"
+                "∧ 缺口幅度≥0.2% ∧ 5日/20日量比≥0.7 ∧ 量比≥0.9 ∧ 涨幅<9.6% ∧ 250日位置≤94% "
+                "—— 今日缺口权重更高；放宽到「近5日」是因为严格当日缺口全市场每天仅个位数，池子会常年为空",
+    },
+    {
+        "id": "pullback", "icon": "⑤", "name": "回踩观察池", "risk": "warn",
+        "book_ref": "《短线操盘实战技法》第 8 章 · 指标均线止损法",
+        "logic": "强势股回踩 MA10/MA20：缩量回踩可低吸；放量下跌=破位，"
+                 "只列观察并打「破位待确认」。",
+        "scan": "日K 精算：MA5>MA10>MA20 ∧ 收盘>MA20 ∧ 距MA20在 -1%~+11% ∧ 近20日涨停≥1次 "
+                "∧ 20日涨幅≥5% → 再按量能分流为「缩量回踩」与「放量破位」",
+    },
+    {
+        "id": "divergence", "icon": "⑥", "name": "底背离池", "risk": "warn",
+        "book_ref": "《短线操盘实战技法》第 3 章 · 底背离双突破买入法",
+        "logic": "MACD 底背离（价格创 60 日新低但 DIF 未创新低）+ 缩量地量 + DIF 上穿 DEA；"
+                 "属反弹型机会，仓位须低于趋势买入。",
+        "scan": "日K 精算：60日价格新低而 DIF 未新低 ∧ 量比<0.75（缩量地量）∧ DIF>DEA ∧ 250日位置≤45%",
+    },
+]
+
+POOL_ORDER = {d["id"]: i for i, d in enumerate(POOL_DEFS)}
+POOL_BY_ID = {d["id"]: d for d in POOL_DEFS}
+POOL_MAX = 40          # 单池最多展示多少只（再多前端也读不完，也会拖慢体检/缠论）
+
+
+def _hi_ex_today(rows, n=20):
+    """不含当日的 n 日最高价。
+
+    ★ 不能直接用 engine.features 的 hi20/hi60：那两个**含当日**，拿来做
+      「突破」判定等于让当日自己证明自己 —— 收盘永远 ≤ 当日最高，
+      `close >= hi20` 只有「收在当日最高价」时才成立，池子会常年空着。
+    """
+    seg = rows[-(n + 1):-1]
+    return max(r[3] for r in seg) if seg else 0.0
+
+
+def _vol20_prev(rows, n=20):
+    """不含当日的 n 日均量（features 的 vol_ma20 含当日，会把「缩量」判轻）。"""
+    seg = rows[-(n + 1):-1]
+    return sum(r[5] for r in seg) / float(len(seg)) if seg else 0.0
+
+
+def _zt_days(rows, n=20, lim=9.8):
+    """近 n 日内涨停的天数（按该票所属板的涨停阈值判定）。"""
+    cnt = 0
+    seg = rows[-(n + 1):]
+    for i in range(1, len(seg)):
+        pc = seg[i - 1][2]
+        if pc > 0 and (seg[i][2] / pc - 1) * 100.0 >= lim:
+            cnt += 1
+    return cnt
+
+
+def _pos52(f):
+    v = f.get("pos52")
+    return 100.0 if v is None else float(v)
+
+
+def _maform(f, rows):
+    """均线形态（唐能通广通形态的**可复算子集**）。
+
+    ★ 只实现能从均线数据直接复算的两类形态，不做 18 式的全量模拟：
+      · 多头/空头排列 —— ma5/ma10/ma20/ma60 的相对位置，纯事实；
+      · 断头铡刀 —— 前一日均线多头、当日一阴同时切断 5/10/20 日线且放量，
+        这是唯一必须当风险标签外露的形态。
+      没命中就返回 grade="none"、brief="" —— 前端 `if (x.maform.brief)` 会
+      直接跳过这枚标签，不留空壳，也不编造命中。
+    """
+    base = {"score": 50, "grade": "none", "grade_text": "无均线形态",
+            "brief": "", "bear": False, "veto": None, "hits": []}
+    ma5, ma10, ma20, ma60 = f.get("ma5"), f.get("ma10"), f.get("ma20"), f.get("ma60")
+    if not (ma5 and ma10 and ma20):
+        return base
+    cl = float(f["close"])
+    date = str(f.get("date") or "")
+    vr = f.get("vol_ratio") or 0
+
+    # 断头铡刀：需要昨日三条均线，所以单独算一次「截至昨日」的均线
+    if len(rows) >= 25:
+        closes = [r[2] for r in rows[:-1]]
+        p5 = sum(closes[-5:]) / 5.0
+        p10 = sum(closes[-10:]) / 10.0
+        p20 = sum(closes[-20:]) / 20.0
+        yc = closes[-1]
+        if yc > p5 > p10 > p20 and cl < ma5 and cl < ma10 and cl < ma20 \
+                and (f.get("pct") or 0) <= -5 and vr >= 1.5:
+            return {"score": 15, "grade": "bear", "grade_text": "断头铡刀（一阴断三线）",
+                    "brief": "断头铡刀", "bear": True,
+                    "veto": "断头铡刀：一阴同时切断 5/10/20 日线且放量",
+                    "hits": [{"name": "断头铡刀", "date": date,
+                              "strength": 90}]}
+
+    if ma60 and ma5 > ma10 > ma20 > ma60:
+        return {"score": 85, "grade": "bull", "grade_text": "四线多头排列",
+                "brief": "四线多头", "bear": False, "veto": None,
+                "hits": [{"name": "四线多头排列", "date": date, "strength": 85}]}
+    if ma5 > ma10 > ma20:
+        return {"score": 72, "grade": "bull", "grade_text": "三线多头排列",
+                "brief": "三线多头", "bear": False, "veto": None,
+                "hits": [{"name": "三线多头排列", "date": date, "strength": 72}]}
+    if ma5 < ma10 < ma20:
+        return {"score": 25, "grade": "bear", "grade_text": "空头排列",
+                "brief": "空头排列", "bear": True, "veto": None,
+                "hits": [{"name": "空头排列", "date": date, "strength": 70}]}
+    return base
+
+
+def _exit_level(f, stop, defense):
+    """三档离场分级（前端按 L0/L1/L2 配红/橙/红描边）。
+
+    L0 灾难：当日暴跌，不等反弹直接走；
+    L2 清仓：收盘破了防守线（摆动低点结构位），趋势拐点被证伪；
+    L1 减仓：收盘破了 MA10 操盘线，或量价出现警示。
+    优先级从 L0 到 L1 递减 —— 同时满足时按最严重的那档报。
+    """
+    cl = float(f.get("close") or 0)
+    pct = f.get("pct") or 0
+    ma10 = f.get("ma10")
+    if pct <= -9.0:
+        return {"level": "L0", "code": "灾难离场", "actions": ["开盘直接离场，不等反弹"],
+                "note": "当日跌幅 %.1f%%，属灾难性下跌，任何计划作废" % pct}
+    if defense and cl < float(defense):
+        return {"level": "L2", "code": "结构清仓",
+                "actions": ["收盘前清仓", "不做次日博弈"],
+                "note": "收盘 %.2f 已跌破防守线 %.2f，趋势拐点被破" % (cl, float(defense))}
+    if stop and cl < float(stop):
+        return {"level": "L2", "code": "止损清仓",
+                "actions": ["按计划止损", "止损后 3 日内不回补"],
+                "note": "收盘 %.2f 已跌破止损位 %.2f" % (cl, float(stop))}
+    if ma10 and cl < float(ma10):
+        return {"level": "L1", "code": "减仓一半",
+                "actions": ["次日冲高减半仓", "剩余仓位以 MA20 为线"],
+                "note": "收盘 %.2f 已在 MA10（%.2f）之下，操盘线走坏" % (cl, float(ma10))}
+    return {"level": "正常", "code": "", "actions": [], "note": "无离场信号，按原计划持有"}
+
+
+RISK_PCT = 2.0        # 单笔风险占总资金 2%（固定风险法的分子）
+RISK_CAP = 15.0       # 单票风险仓位上限（%）
+CAPITAL = 100000.0    # 展示用的名义资金，仅用于把百分比翻成「买多少万」
+
+
+def _risk_pos(close, stop):
+    """固定风险法倒推仓位：单笔风险 2% ÷ 止损距离，再封顶 15%。
+
+    「止损越宽仓位越轻」是这套公式的全部意义 —— 止损 4% 的票可以上 15%，
+    止损 10% 的票只能上 2/10=20%…但再宽就不该开，所以 15% 封顶。
+    """
+    dist = (close - stop) / close * 100.0 if close else 0.0
+    if dist <= 0:
+        return {"pct": 0.0, "basis": "止损位不低于现价，仓位无法倒推", "risk_per_share": 0.0,
+                "note": "价位异常，本票不给仓位建议"}
+    raw = RISK_PCT / dist * 100.0
+    pct = round(min(raw, RISK_CAP), 1)
+    cap_txt = "（封顶 %.0f%%）" % RISK_CAP if raw > RISK_CAP else ""
+    return {
+        "pct": pct,
+        "basis": "单笔风险 %.0f%% ÷ 止损距离 %.1f%% = %.0f%%%s" % (RISK_PCT, dist, raw, cap_txt),
+        "risk_per_share": round(close - stop, 2),
+        "note": "10 万资金此票最多买 %.1f 万（占总资金 %.0f%%）" % (CAPITAL * pct / 100.0 / 1e4, pct),
+    }
+
+
+def _defense(f, rows):
+    """防守线 = 最近一个摆动低点 × 0.995。
+
+    ★ valid=False 的两种情况必须显式给出来，不能悄悄返回 null：
+      1) 没有摆动低点（K 线不足）→ price=None；
+      2) 最近摆动低点**已经高于现价**（说明趋势在上移而价格掉下来了，
+         这个低点不再是支撑）→ price=None + note 说明，前端会印「防守线失效」。
+    """
+    lows = f.get("sw_lows") or []
+    if not lows:
+        return {"price": None, "date": f.get("date"), "basis": "K 线不足，未形成摆动低点",
+                "valid": False, "note": "防守线失效（结构位缺失），等新摆动低点形成"}
+    idx, px = lows[-1]
+    date = rows[idx][0] if 0 <= idx < len(rows) else f.get("date")
+    level = round(px * 0.995, 2)
+    close = float(f.get("close") or 0)
+    if level >= close:
+        return {"price": None, "date": date,
+                "basis": "摆动低点 %.2f（%s）已高于现价 %.2f" % (px, date, close),
+                "valid": False, "note": "防守线失效（趋势反转），等新摆动低点形成"}
+    return {"price": level, "date": date,
+            "basis": "摆动低点 %.2f（%s）× 0.995" % (px, date),
+            "valid": True, "note": "跌破 %.2f 即趋势拐点被破，离场" % level}
+
+
+def _round(v, n=2):
+    try:
+        return round(float(v), n)
+    except (TypeError, ValueError):
+        return None
+
+
+def _atr(f):
+    a = f.get("atr")
+    cl = float(f.get("close") or 0)
+    return float(a) if a else cl * 0.02
+
+
+def _plan_base(f, rows, buy_lo, buy_hi, buy_label, stop, sell, position, hold):
+    """六个池共用的计划骨架：价位全由传入值决定，这里只负责拼装与兜底。"""
+    close = float(f.get("close") or 0)
+    if close <= 0:
+        return {}
+    atr = _atr(f)
+    # 目标位统一用 ATR 递推，并用前高做地板 —— 目标低于现价 0.5% 等于没设目标
+    t1 = max(close + 1.5 * atr, float(f.get("hi20") or 0))
+    if t1 <= close * 1.005:
+        t1 = close + 1.5 * atr
+    t1 = min(t1, close * 1.25)
+    t2 = max(t1 + 1.5 * atr, float(f.get("hi60") or 0))
+    t2 = min(max(t2, t1 + atr), close * 1.50)
+    # 止损必须落在买点下沿之下：龙头池曾给出「买 2.42~2.65、止损 2.46」这种
+    # 计划 —— 买点区间里就已经触发止损，等于没给计划。
+    stop = min(float(stop), close * 0.995, float(buy_lo) * 0.995)
+    dz = "（%s）" % buy_label if buy_label else ""
+    return {
+        "buy_zone": "%.2f ~ %.2f%s" % (round(buy_lo, 2), round(buy_hi, 2), dz),
+        "stop_loss": _round(stop),
+        "stop_pct": _round((stop / close - 1) * 100, 1),
+        "target1": _round(t1),
+        "target2": _round(t2),
+        "position": position,
+        "hold": hold,
+        "sell_signal": sell,
+    }
+
+
+def _finish_plan(plan, f, rows):
+    """补齐 plan 的纪律层（defense / risk_pos / exit_level）。
+
+    ★ 前端 renderShortStock 只读 buy_zone/stop_loss/target1/target2/position/
+      hold/sell_signal；但罗盘页的 rscPickCard 会读 defense/risk_pos/exit_level。
+      同一只票在两处出现时字段必须同形，所以这里一次补齐，不留半套。
+    """
+    if not plan:
+        return plan
+    close = float(f.get("close") or 0)
+    defense = _defense(f, rows)
+    plan["defense"] = defense
+    plan["risk_pos"] = _risk_pos(close, float(plan.get("stop_loss") or close * 0.92))
+    plan["exit_level"] = _exit_level(f, plan.get("stop_loss"), defense.get("price"))
+    return plan
+
+
+def _stage_hold(f, rows):
+    """6 池统一的持仓周期基准：趋势型 1-5 日，反弹型 1-3 日。"""
+    return (f.get("pct") or 0)
+
+
+# ---- 逐池判定 ---------------------------------------------------------------
+# 每个 _hit_* 返回 None（不命中）或 {tags, reason, board, hi_risk, plan}
+# 条件必须与 POOL_DEFS[pid]["scan"] 逐条对应。
+
+def _hit_breakout(f, rows, ind):
+    pct = f.get("pct") or 0
+    if not (1.0 <= pct <= 9.6):
+        return None
+    ma5, ma10, ma20 = f.get("ma5"), f.get("ma10"), f.get("ma20")
+    if not (ma5 and ma10 and ma20 and ma5 > ma10 > ma20):
+        return None
+    hi20 = _hi_ex_today(rows, 20)
+    cl = float(f["close"])
+    if not hi20 or cl < hi20 * 0.999:
+        return None
+    vr = f.get("vol_ratio") or 0
+    if vr < 1.15:
+        return None
+    v5, v20 = f.get("vol_ma5") or 0, _vol20_prev(rows, 20)
+    if not v5 or not v20 or (v5 / v20) > 4:
+        return None
+    if _pos52(f) > 92:
+        return None
+
+    brk = (cl / hi20 - 1) * 100
+    tags = ["放量突破 20 日新高 +%.2f%%" % brk, "MA5>MA10>MA20 多头排列", "量比 %.2f" % vr]
+    reason = ("%s：今日收 %.2f 元（%+.2f%%），放量突破近 20 日最高 %.2f 元，"
+              "MA5/MA10/MA20（%.2f/%.2f/%.2f）多头排列，量能较前 5 日均量放大至 %.2f 倍，"
+              "属标准的高低点突破形态。") % (ind, cl, pct, hi20, ma5, ma10, ma20, vr)
+    # 买点：回踩 5 日线，不追现价；止损：跌破 10 日线
+    buy_lo, buy_hi = ma5, max(ma5, cl * 0.995)
+    stop = min(ma10 * 0.99, cl * 0.92)
+    plan = _plan_base(
+        f, rows, buy_lo, buy_hi, "回踩 5 日线 %.2f 不破" % ma5, stop,
+        "跌破 10 日线（%.2f）或冲高回落 3%% 即走；连续 3 日滞涨减半仓" % ma10,
+        "2 成", "1-5 个交易日")
+    return {"tags": tags, "reason": reason,
+            "board": "%s · 距 250 日高点 %.0f%%" % (ind, _dist250(f)),
+            "hi_risk": False, "plan": plan, "_sort": brk}
+
+
+def _dist250(f):
+    hi = f.get("hi250")
+    cl = float(f.get("close") or 0)
+    if not hi or not cl:
+        return 0.0
+    return max(0.0, (hi - cl) / hi * 100.0)
+
+
+def _hit_gap(f, rows, ind):
+    if len(rows) < 21:
+        return None
+    pct = f.get("pct") or 0
+    if pct >= 9.6:
+        return None
+    cl = float(f["close"])
+    v5, v20 = f.get("vol_ma5") or 0, _vol20_prev(rows, 20)
+    if not v20 or (v5 / v20) < 0.7:
+        return None
+    if (f.get("vol_ratio") or 0) < 0.9:
+        return None
+    if _pos52(f) > 94:
+        return None
+
+    # 逐日找向上缺口：今日优先（权重高），再看前 4 日是否仍未回补
+    best = None
+    for back in range(1, 6):
+        i = len(rows) - back
+        if i < 1:
+            break
+        lo_i, hi_prev = rows[i][4], rows[i - 1][3]
+        if hi_prev <= 0 or lo_i <= hi_prev:
+            continue
+        gp = (lo_i / hi_prev - 1) * 100.0
+        if gp < 0.2:
+            continue
+        if cl <= hi_prev:          # 缺口已被回补
+            continue
+        if best is None:
+            best = {"back": back, "low": lo_i, "prev_hi": hi_prev, "gap": gp,
+                    "date": rows[i][0]}
+    if not best:
+        return None
+
+    today = best["back"] == 1
+    tags = [("今日向上跳空 %.2f%% 未回补" % best["gap"]) if today
+            else ("%s 向上跳空 %.2f%% 未回补" % (best["date"][-5:], best["gap"])),
+            "缺口下沿 %.2f 元即支撑" % best["prev_hi"],
+            "量比 %.2f" % (f.get("vol_ratio") or 0),
+            "5日/20日量比 %.2f" % (v5 / v20 if v20 else 0)]
+    if today:
+        reason = ("%s：今日最低 %.2f 元高于昨日最高 %.2f 元，形成缺口支撑；"
+                  "量能 %.2f 倍于近期均量。缺口下沿 %.2f 元是本形态的止损锚点，"
+                  "一旦被回补即视为支撑失效。") % (ind, best["low"], best["prev_hi"],
+                                              f.get("vol_ratio") or 0, best["prev_hi"])
+    else:
+        reason = ("%s：%s 向上跳空 %.2f%% 留下缺口（%.2f→%.2f），至今未回补，"
+                  "今日收 %.2f 元仍在缺口上方，缺口下沿即支撑。") % (
+            ind, best["date"], best["gap"], best["prev_hi"], best["low"], cl)
+    # 买点：缺口下沿 → 今日最低（跌回缺口里接）；止损：缺口下沿 × 0.995
+    buy_lo, buy_hi = best["prev_hi"], max(best["low"], best["prev_hi"])
+    stop = best["prev_hi"] * 0.995
+    plan = _plan_base(
+        f, rows, buy_lo, buy_hi, "缺口上沿至今日低点", stop,
+        "缺口被回补（收盘跌破 %.2f）即离场，缺口支撑失效" % best["prev_hi"],
+        "≤2 成", "1-5 个交易日")
+    return {"tags": tags[:4], "reason": reason,
+            "board": "%s · %s" % (ind, "今日缺口" if today else "近 5 日缺口"),
+            "hi_risk": False, "plan": plan, "_sort": (1 if today else 0) * 100 + best["gap"]}
+
+
+def _hit_pullback(f, rows, ind):
+    ma5, ma10, ma20 = f.get("ma5"), f.get("ma10"), f.get("ma20")
+    if not (ma5 and ma10 and ma20 and ma5 > ma10 > ma20):
+        return None
+    cl = float(f["close"])
+    if cl <= ma20:
+        return None
+    dev = (cl / ma20 - 1) * 100.0
+    if not (-1.0 <= dev <= 11.0):
+        return None
+    lim = _limit_pct(str(f["code"]))
+    zt = _zt_days(rows, 20, lim)
+    if zt < 1:
+        return None
+    chg20 = f.get("chg20") or 0
+    if chg20 < 5:
+        return None
+
+    v20 = _vol20_prev(rows, 20)
+    v_today = float(f.get("vol") or 0)
+    shrink = bool(v20) and v_today < v20 * 0.85
+    vr = f.get("vol_ratio") or 0
+    tags = ["近 20 日 %d 次涨停" % zt,
+            "MA5/10/20 = %.2f/%.2f/%.2f" % (ma5, ma10, ma20)]
+    if shrink:
+        tags.append("量比 %.2f（缩量回踩）" % vr)
+        reason = ("%s：近 20 日 %d 次涨停、20 日涨幅 %+.1f%%，今日缩量回踩 %+.2f%%"
+                  "（量比 %.2f），MA5>MA10>MA20 多头排列未破，收盘仍在 MA20（%.2f）上方 "
+                  "—— 属健康回踩，可低吸。") % (ind, zt, chg20, f.get("pct") or 0, vr, ma20)
+    else:
+        tags.append("量比 %.2f（放量下跌）" % vr)
+        reason = ("%s：近 20 日 %d 次涨停、20 日涨幅 %+.1f%%，今日放量下跌 %+.2f%%"
+                  "（量比 %.2f）且量能高于 20 日均量，虽仍在 MA20（%.2f）上方，"
+                  "但已属「放量破位」形态 —— 只列观察，等缩量止跌再谈低吸。") % (
+            ind, zt, chg20, f.get("pct") or 0, vr, ma20)
+    # 买点：MA10 附近缩量止跌；止损：MA20 × 0.985（均线止损法）
+    buy_lo, buy_hi = min(ma10, cl) * 0.995, max(ma10, cl) * 1.01
+    stop = ma20 * 0.985
+    plan = _plan_base(
+        f, rows, buy_lo, buy_hi, "MA10 %.2f 附近缩量止跌" % ma10, stop,
+        "放量收破 MA20（%.2f）即离场" % ma20,
+        "≤2 成", "1-5 个交易日")
+    return {"tags": tags, "reason": reason,
+            "board": "%s · 回踩 MA20" % ind,
+            "hi_risk": False, "warn": (not shrink), "plan": plan,
+            "_sort": zt * 10 + chg20}
+
+
+def _hit_divergence(f, rows, ind):
+    """底背离：价格创新低，而 DIF 没有跟着创新低。
+
+    ★ 判定必须比「今天就在 60 日最低点」宽一层。实测过更严的写法：
+      要求当日收盘 = 60 日最低（1% 容差）∧ DIF>DEA，全市场 1800 只里
+      命中 **0** 只 —— 因为在最低点那天 DIF 基本都在 DEA 下方。
+      底背离是**两段**比较：把 60 根 K 线切成前后各 30 根，
+      后半段的最低价比前半段更低（价格新低），但该低点处的 DIF 比前半段
+      低点处的 DIF 更高（动能没新低）。这才是教科书里的背离。
+      当日还需 DIF>DEA（背离已被确认）、缩量地量、250 日位置 ≤45%。
+    """
+    closes = [r[2] for r in rows]
+    cl = float(f["close"])
+    if len(closes) < 65:
+        return None
+    seg = closes[-60:]
+    early, late = seg[:30], seg[30:]
+    pl_e, pl_l = min(early), min(late)
+    if pl_l > pl_e * 1.001:            # 后半段没创出新低
+        return None
+    difs = engine.macd(closes)[0][-60:]
+    d_e = difs[early.index(pl_e)]
+    i_l = 30 + late.index(pl_l)
+    d_l = difs[i_l]
+    if d_e is None or d_l is None or d_l <= d_e:      # DIF 同步新低 → 无背离
+        return None
+    dif, dea = f.get("dif"), f.get("dea")
+    if dif is None or dea is None or dif <= dea:      # 背离尚未被金叉确认
+        return None
+    vr = f.get("vol_ratio") or 1.0
+    if vr >= 0.75:                                   # 要求缩量地量
+        return None
+    if _pos52(f) > 45:                               # 只做低位，不做高位假背离
+        return None
+
+    bars_from_low = len(seg) - 1 - i_l
+    tags = ["MACD 底背离（DIF %.3f > DEA %.3f）" % (dif, dea),
+            "缩量地量（量比 %.2f）" % vr,
+            "60 日低点在 %d 根前" % bars_from_low,
+            "250 日位置 %.0f%%" % _pos52(f)]
+    reason = ("%s：股价创 60 日新低（%.2f → %.2f）但 MACD DIF 未同步创新低"
+              "（%.3f → %.3f），形成底背离；今日缩量（量比 %.2f）且 DIF 上穿 DEA，"
+              "超跌反弹条件成立。注意：底背离属反弹型机会，仓位须低于趋势买入。") % (
+        ind, pl_e, pl_l, d_e, d_l, vr)
+    # 买点：不追高，等缩量回踩到现价下方 4%；止损：现价 -8%（20 日最低通常太远）
+    buy_lo, buy_hi = cl * 0.96, cl
+    stop = cl * 0.92
+    plan = _plan_base(
+        f, rows, buy_lo, buy_hi, "不追高，等缩量回踩", stop,
+        "跌破 20 日最低（%.2f）或 DIF 再次死叉即离场" % (f.get("lo20") or 0),
+        "1 成（反弹型，勿重仓）", "1-3 个交易日")
+    return {"tags": tags, "reason": reason,
+            "board": "%s · MACD 底背离" % ind,
+            "hi_risk": True, "plan": plan, "_sort": -bars_from_low}
+
+
+_HIT = {
+    "breakout": _hit_breakout,
+    "gap": _hit_gap,
+    "pullback": _hit_pullback,
+    "divergence": _hit_divergence,
+}
+
+
+# ---- 涨停接力池 / 热点龙头池：候选来自外部数据源，不走 K 线扫描 -------------
+
+def _hit_limit_up(row, f, ind):
+    """涨停接力：封板质量合格才接力。
+
+    row 来自东财涨停池（_pool_row 的形状），f 是该票的 K 线特征。
+    两条硬门槛：炸板次数 <2（反复开板说明封不住）、封成比 ≥1%
+    （封单额 / 流通市值，衡量封板决心而不是绝对金额）。
+    """
+    if int(row.get("open_times") or 0) >= 2:
+        return None
+    seal_wan = float(row.get("seal_wan") or 0)          # 万元
+    nmc = float((row.get("nmc_yi") or 0))               # 亿元
+    if nmc <= 0 or seal_wan <= 0:
+        return None
+    seal_ratio = seal_wan / (nmc * 1e4) * 100.0          # 万元 / 万元 = 比例
+    if seal_ratio < 1.0:
+        return None
+    streak = int(row.get("streak") or 1)
+    tags = ["%d 连板" % streak,
+            "封单 %.2f 亿（占流通市值 %.1f%%）" % (seal_wan / 1e4, seal_ratio),
+            "换手 %.1f%%" % float(row.get("turnover") or 0)]
+    reason = ("%s：%d 板· %s，封单 %.2f 亿、封成比 %.1f%%、换手 %.1f%%。"
+              "封成比越高说明封板越坚决；次日竞价高开 0~3%% 为健康区间，可接力。") % (
+        ind, streak, "未炸板" if not int(row.get("open_times") or 0)
+        else "炸板 %d 次" % int(row.get("open_times") or 0),
+        seal_wan / 1e4, seal_ratio, float(row.get("turnover") or 0))
+    cl = float(f.get("close") or row.get("price") or 0)
+    # 买点：次日竞价 -1%~+3%；止损：涨停前一日收盘 ×0.995（涨停的起点不能被跌穿）
+    buy_lo, buy_hi = cl * 0.96, cl
+    prev_close = float(f.get("prev_close") or cl / 1.1)
+    stop = min(prev_close * 0.995, cl * 0.93)
+    plan = _plan_base(
+        f, [], buy_lo, buy_hi, "次日竞价高开 -1%~+3% 区间", stop,
+        "开板不封 / 冲高回落 3% / 低开 3% 不翻红，任一条即离场",
+        "1 成", "1-3 个交易日")
+    return {"tags": tags, "reason": reason,
+            "board": "%d 板·%s" % (streak, "未炸板" if not int(row.get("open_times") or 0)
+                                  else "炸板 %d 次" % int(row.get("open_times") or 0)),
+            "hi_risk": streak >= 4, "plan": plan,
+            "_sort": streak * 1000 + seal_ratio * 10 + float(row.get("turnover") or 0)}
+
+
+def _hit_leader(sector, rank, lad, f, ind):
+    """热点龙头：只做主线板块里的梯队长，4 板以上只当情绪标杆。"""
+    streak = int(lad.get("streak") or 0)
+    if streak >= 4:
+        return None
+    sname = sector.get("name") or ""
+    grade = sector.get("grade") or ""
+    strength = sector.get("strength") or 0
+    pos = rank + 1
+    tags = ["%s · %s（强度 %.1f）" % (sname, grade, strength),
+            "板块内梯队第 %d 位" % pos]
+    if streak:
+        tags.append("%d 连板" % streak)
+    reason = ("【%s】板块（%s，强度 %.1f，全市场涨停 %d 家 / 主力净流入 %+.2f 亿）内"
+              "排名第 %d 的票。按《游资全景看盘》口径，只做主线板块的龙头，"
+              "不做跟风补涨。") % (sname, grade, strength, sector.get("zt_cnt") or 0,
+                                sector.get("main_net_yi") or 0, pos)
+    cl = float(f.get("close") or 0)
+    ma5 = f.get("ma5") or cl
+    buy_lo, buy_hi = min(ma5, cl) * 0.99, cl
+    stop = min(float(f.get("ma10") or cl * 0.93) * 0.99, cl * 0.93)
+    plan = _plan_base(
+        f, [], buy_lo, buy_hi, "次日竞价不高开超 3%", stop,
+        "开板不封即离场；若同板块跟风股集体走弱则减仓",
+        "≤2 成", "1-3 个交易日")
+    return {"tags": tags, "reason": reason,
+            "board": ("%d 板 · %s" % (streak, sname)) if streak else sname,
+            "hi_risk": False, "plan": plan,
+            "_sort": (6 - sector.get("_rank", 9)) * 100 - pos * 10 + streak}
+
+
+# ---- 组装单只票的对外结构 ---------------------------------------------------
+
+def _stock_of(f, rows, ind, hit, pool_id):
+    """把「特征 + 池判定结果」拼成前端要的完整结构。
+
+    ★ 前端 renderShortStock 直接读 s.plan.buy_zone / s.tags / s.reason /
+      s.board / s.high_risk，缺一个就印 undefined；rscPickCard 还额外读
+      s.maform.brief / s.plan.defense / s.plan.risk_pos / s.plan.exit_level。
+      这里一次给全，字段形状与原站对齐。
+    """
+    code = str(f["code"])
+    plan = _finish_plan(hit.get("plan") or {}, f, rows)
+    return {
+        "code": code,
+        "setcode": "1" if code[:1] == "6" else "0",
+        "secid": engine.secid_of_code(code),
+        "name": f.get("name") or "",
+        "price": _round(f.get("close")),
+        "pct": _round(f.get("pct")),
+        "board": hit.get("board") or ind,
+        "industry": ind,
+        "tags": list(hit.get("tags") or [])[:4],
+        "reason": hit.get("reason") or "",
+        "high_risk": bool(hit.get("hi_risk")),
+        "risk_warn": bool(hit.get("warn")),
+        "plan": plan,
+        "gate": None,
+        "mw_type": None, "mw_score": None,
+        "maform": _maform(f, rows),
+        "pool_id": pool_id,
+        "_sort": hit.get("_sort") or 0,
+    }
+
+
+# ---- 候选收集 ---------------------------------------------------------------
 
 def _ctx(code, snap_map):
     """取一只票的 K 线与特征；K 线缺失返回 None。"""
@@ -724,31 +1538,11 @@ def _ctx(code, snap_map):
     return rows, f
 
 
-def _enrich(st, rows, f, lhb_items, need_checkup=True):
-    """把前端要的附加字段补齐：体检结论 / 缠论分 / 量价分区 / 突破窗口 / 龙虎榜。"""
-    if need_checkup and not st.get("checkup"):
-        try:
-            st["checkup"] = engine.checkup(f)
-        except Exception:
-            st["checkup"] = None
-    if "chan_score" not in st:
-        st["chan_score"] = None
-    try:
-        st["vp"] = engine.volprice(f)
-    except Exception:
-        st["vp"] = None
-    st["bo"] = bo_of(rows)
-    L = (lhb_items or {}).get(st.get("code") or "")
-    if L:
-        st["lhb"] = L
-    return st
-
-
 def _industry_map(codes):
-    """批量取行业名（f100，如「影视院线」「半导体」）。一页 80 个 secid，173 只票 3 次请求。
+    """批量取行业名（f100，如「影视院线」「半导体」）。一页 80 个 secid。
 
-    不复用板块成分表：成分只覆盖候选的 18 个板块，池子其余票会退化成「行业 --」，
-    实测 173 只里有 67 只。f100 是东财给每只票的细分行业，一次拿全。
+    不复用板块成分表：成分只覆盖候选的十几个板块，池子其余票会退化成
+    「行业 --」，实测能缺三分之一。f100 是东财给每只票的细分行业，一次拿全。
     """
     out = {}
     codes = [c for c in dict.fromkeys(codes) if c]
@@ -780,389 +1574,320 @@ def _vp_counts(stocks):
     return c
 
 
-# ---------------------------------------------------------------------------
-# 五之二、交易计划（前端 renderShortStock 读 s.plan，缺字段会直接印出 undefined）
-# ---------------------------------------------------------------------------
-STOP_MAX = 0.07          # 止损最宽 7%：3 日持仓的票，再宽的止损不叫止损
-
-
-def _make_plan(rows, f, bo):
-    """把 K 线特征翻成「买点 / 止损 / 目标 / 仓位 / 持有周期 / 卖出信号」。
-
-    全部由数据推导，没有一条是写死的常数：
-      买点   = MA5 与现价之间（回踩短均线接，不追高）
-      止损   = max(近 5 日最低, 现价 −7%)，再压到现价之下 ——
-               近 5 日最低就是「拉起来那根 K 线的地板」，破了说明这波失败；
-               但高位票的 5 日最低可能离现价 20%，所以用 7% 封顶。
-      目标① = max(现价 + 1.5×ATR, 20 日高点)，封顶 +25%
-      目标② = max(目标① + 1.5×ATR, 60 日高点)，封顶 +50%
-      仓位/周期 = 跟 21 天突破窗口走：首启有赔率、末窗只减不加。
-    """
-    close = float(f.get("close") or 0)
-    if close <= 0:
-        return {}
-    atr = float(f.get("atr") or 0) or close * 0.02
-    ma5 = float(f.get("ma5") or close)
-    lo5 = min(float(r[4]) for r in rows[-5:]) if len(rows) >= 5 else close * 0.95
-
-    # 买点区间要能真的挂单：现价之上的 4% 内回踩接。若直接写 MA5 到现价，
-    # 刚拉过一根大阳线的票会得到「8.12 ~ 10.35」这种 27% 宽的区间，等于没给。
-    if close > ma5:
-        lo, hi = max(ma5, close * 0.96), close
-    else:
-        lo, hi = close * 0.98, close
-    stop = min(max(lo5, close * (1 - STOP_MAX)), close * 0.995)
-
-    t1 = max(close + 1.5 * atr, float(f.get("hi20") or 0))
-    if t1 <= close * 1.005:
-        t1 = close + 1.5 * atr
-    t1 = min(t1, close * 1.25)
-    t2 = max(t1 + 1.5 * atr, float(f.get("hi60") or 0))
-    t2 = min(max(t2, t1 + atr), close * 1.50)
-
-    ph = (bo or {}).get("phase") or ""
-    position = {"首启": "3 成", "验证": "2 成", "末窗": "1 成（只减不加）",
-                "过窗": "0（不参与）", "失守": "0（不参与）"}.get(ph, "1 成")
-    hold = {"首启": "1~5 日", "验证": "3~8 日", "末窗": "1~3 日"}.get(ph, "1~3 日")
-
-    # 卖出信号必须只留真正会先触发的那条：MA10 在止损位以下时，写「跌破 MA10 即走」
-    # 等于给了一个永远不会先到、也没有意义的位置（实测有票 MA10 在 7.63、止损在 9.63）。
-    ma10 = float(f.get("ma10") or close)
-    if ma10 > stop:
-        sell = "收盘跌破 MA10（%.2f）即走，或 %.1f%% 止损（%.2f）" % (
-            ma10, (stop / close - 1) * 100, stop)
-    else:
-        sell = "%.1f%% 止损（%.2f）为先；MA10 在 %.2f、低于止损位，不另作离场参考" % (
-            (stop / close - 1) * 100, stop, ma10)
-    if ph == "末窗":
-        sell += "；已到末窗，反弹只减不加"
-    elif ph in ("过窗", "失守"):
-        sell += "；已过突破窗口，不新开仓"
-
-    # 写明基准日：卡片上的价格是实时行情，计划是按最后一根收盘 K 线算的，
-    # 盘中跌下去以后「现价」会低于买点下沿，不标基准日会被误读成区间失效。
-    sell = "计划按 %s 收盘测算；%s" % (str(f.get("date") or "上一交易日")[-5:], sell)
-
-    return {
-        # 基准日不放买点格里：那一格宽度只够 ~24 个字符，带上日期必然折成两行，
-        # 整行高度跟着变。挪到下面整行的卖出信号前面，信息不丢、排版不歪。
-        "buy_zone": "%.2f ~ %.2f" % (round(lo, 2), round(hi, 2)),
-        "stop_loss": round(stop, 2),
-        "stop_pct": round((stop / close - 1) * 100, 1),
-        "target1": round(t1, 2),
-        "target2": round(t2, 2),
-        "position": position,
-        "hold": hold,
-        "sell_signal": sell,
-    }
-
-
-def _tags_of(st, f):
-    """标签只列事实，不下判断：涨停 / 大阳 / 倍量 / 突破首启。"""
-    out = []
-    pct = float(st.get("pct") or f.get("pct") or 0)
-    lim = _limit_pct(str(st.get("code") or ""))
-    if pct >= lim:
-        out.append("涨停")
-    elif pct >= 5:
-        out.append("大阳")
-    if float(f.get("vol_ratio") or 0) >= 2:
-        out.append("倍量")
-    if (st.get("bo") or {}).get("phase") == "首启":
-        out.append("突破首启")
-    return out[:3]
-
-
-def _reason_of(st):
-    """一句话结论：只拼接已有的客观事实，不加主观评价。"""
-    bits = []
-    bo = st.get("bo") or {}
-    if bo.get("day"):
-        bits.append("突破第 %d 天" % bo["day"])
-    ck = (st.get("checkup") or {}).get("verdict")
-    if ck:
-        bits.append("体检" + ck)
-    gate = (st.get("vp") or {}).get("gate")
-    bits.append({"pass": "量价确认", "block": "量价警示"}.get(gate, "量价中性"))
-    money = (st.get("lhb") or {}).get("money")
-    if money:
-        bits.append("龙虎榜" + money)
-    return " · ".join(bits)
-
-
-POOL_DEFS = [
-    {
-        "id": "chaoduan", "icon": "⚡", "name": "超短打板",
-        "book_ref": "《游资全景看盘》· 当日强度优先",
-        "logic": "只看当日强度与流动性，不看基本面：涨停/大阳、倍量、短均线多头、"
-                 "贴近 60 日高点、收盘强势、成交额过亿，命中 ≥4 条入选。持仓 1~3 日。",
-        "scan": "超短七条（涨停或 ≥5% / 量比 ≥2 / MA5>MA10 / 距 60 日高点 ≥98% / "
-                "上影 ≤25% / 成交额 ≥1 亿）命中 ≥4",
-        "risk": "warn",
-    },
-    {
-        "id": "strong", "icon": "🔥", "name": "强势突破",
-        "book_ref": "《笑傲股市》· 强势股筛选",
-        "logic": "趋势与量能同时达标的中线强势股：均线多头、阶段涨幅居前、"
-                 "量比健康、回撤可控。作为短线池的「势」的底座。",
-        "scan": "强势股扫描（趋势 / 量能 / 位置 / 回撤多维打分）",
-        "risk": "",
-    },
-    {
-        "id": "right3", "icon": "✔", "name": "右侧位置3",
-        "book_ref": "右侧交易体系 · 贴均线等确认",
-        "logic": "六个右侧池里位置态为「位置3」的并集：贴着均线等确认，"
-                 "不猜底、不追高。这是全站验证过的唯一在两个窗口都为正的位置。",
-        "scan": "右侧六池（突破 / 布林 / 年线 / MACD / 平台 / 回踩）中位置态 = 位置3",
-        "risk": "",
-    },
-    {
-        "id": "dragon", "icon": "🐲", "name": "龙头接力",
-        "book_ref": "《龙头股战法》· 只做最强的",
-        "logic": "四维（带动性 / 封板质量 / 形态位置 / 量能资金）≥80 的真龙，"
-                 "以 MA10 为生命线。接力只做第一次回踩，不接退潮期反抽。",
-        "scan": "龙头四维等权合成 ≥80（真龙档）",
-        "risk": "warn",
-    },
-    {
-        "id": "mainwave", "icon": "🌊", "name": "主升浪",
-        "book_ref": "《主升浪战法》· 三类买点",
-        "logic": "A 突破当日、B 回踩 5~10 日线、C 回踩 20 日线。"
-                 "短线优先取 A 与 B，C 属于中线加仓位。",
-        "scan": "主升浪三类买点（A 突破 / B 回踩短均线 / C 回踩 20 日线）",
-        "risk": "",
-    },
-    {
-        "id": "lhb", "icon": "🏦", "name": "龙虎榜异动",
-        "book_ref": "龙虎榜席位 · 资金性格",
-        "logic": "当日上榜且买方净买入为正的个股，按资金性格标注是游资、机构、"
-                 "通道还是散户接盘。**只作对手方提示，不参与任何评分。**",
-        "scan": "当日龙虎榜上榜 且 买前五合计 > 卖前五合计",
-        "risk": "warn",
-    },
-]
-
-
 def _pool(id_, **kw):
     d = {"id": id_, "icon": "·", "name": id_, "book_ref": "", "logic": "",
-         "scan": "", "scanned": 0, "risk": "", "empty_msg": "今日无符合条件标的",
+         "scan": "", "scanned": 0, "risk": "normal", "empty_msg": "今日无符合条件标的",
          "stocks": [], "vp_counts": {"confirm": 0, "warn": 0, "mid": 0, "none": 0}}
     d.update(kw)
     return d
 
 
-def _norm_stock(x, code_key="code"):
-    return {
-        "code": str(x.get(code_key) or x.get("code") or ""),
-        "setcode": str(x.get("setcode") or ("1" if str(x.get("code") or "").startswith("6") else "0")),
-        "name": x.get("name") or "",
-        "industry": x.get("industry") or "--",
-        "price": x.get("price"),
-        "pct": x.get("pct"),
-    }
+def _pool_meta(pid):
+    d = POOL_BY_ID[pid]
+    return {"icon": d["icon"], "name": d["name"], "book_ref": d["book_ref"],
+            "logic": d["logic"], "scan": d["scan"], "risk": d["risk"]}
 
 
-def _collect(lhb_items):
-    """从各数据源收集候选，再去重、限量、统一补齐派生字段。
+LHB_TAIL = 12     # 龙虎榜异动标的并入池尾展示的数量上限
 
-    三个 server.api_* 都是全市场扫描（各自内部有 180~300 秒缓存），串行跑首屏要
-    13 秒，所以并发发起；去重必须串行（后一个池要跳过前一个池已经收走的票），
-    因此先取数、再组装。
+
+def _collect(sent, sectors, snap_map, lhb_items=None):
+    """六个池的收集与组装。
+
+    分三步，顺序不能换：
+      1) 快照层定 universe（主板 · 非ST · <200亿），并按成交额截断出日K精算集合；
+      2) 六个池各自判定 —— 突破/缺口/回踩/底背离走日K扫描，
+         涨停接力走东财涨停池，热点龙头走板块梯队；
+      3) 跨池去重（窄池先领）+ 统一补齐体检/量价/缠论（只对最终入选的票算，
+         因为 checkup 里含缠论，对 2000 只票算一遍要几十秒）。
     """
-    import server  # 延迟导入：server 会 import 本模块，运行期再取避免循环依赖
+    universe_total, pre = _universe(snap_map)
+    pre_map = {str(r.get("code")): r for r in pre}
 
-    def safe(fn):
-        try:
-            return fn()
-        except Exception as e:
-            return {"__error__": str(e)}
+    # ---- 1) 日 K 精算集合 ----
+    by_amt = sorted(pre, key=lambda r: -(r.get("amount") or 0))
+    scan_codes = [str(r["code"]) for r in by_amt[:KLINE_SCAN_MAX]]
+    td = engine.latest_trade_date()
+    try:
+        engine.ensure_klines(scan_codes, td)
+    except Exception:
+        pass
 
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        f_cd = ex.submit(safe, lambda: server.api_chaoduan({}))
-        f_dr = ex.submit(safe, lambda: server.api_dragon({}))
-        f_mw = ex.submit(safe, lambda: server.api_mainwave({}))
-        chaoduan, dragon, mainwave = f_cd.result(), f_dr.result(), f_mw.result()
+    feat = {}
+    for code in scan_codes:
+        ctx = _ctx(code, snap_map)
+        if ctx:
+            feat[code] = ctx
 
-    strong = engine.load_strong() or {}
-    right = engine.load_rightside() or {}
+    pools = []
+    seen = {}
 
-    pools, seen = [], {}
+    def take(items, limit=POOL_MAX):
+        """去重 + 截断。返回 (入选列表, 命中数)。
 
-    def take(items, limit):
-        """去重 + 截断。返回 (入选列表, 命中数)。"""
+        去重先到先得，所以调用顺序必须是「窄池优先」—— 龙头池全市场可能只有
+        六七只，若让底背离（几十只）先领，真龙会被宽池吞掉。
+        """
         hit = len(items)
         out = []
-        for x in items:
-            code = str(x.get("code") or "")
-            if not code or code in seen or len(out) >= limit:
+        for st in items:
+            code = st["code"]
+            if code in seen or len(out) >= limit:
                 continue
-            st = _norm_stock(x)
-            for k in ("chan_score", "chan_grade", "checkup", "vp"):
-                if x.get(k) is not None:
-                    st[k] = x.get(k)
             seen[code] = st
             out.append(st)
         return out, hit
 
-    # ---- 领取顺序：窄池优先 ----
-    # 一只票同时满足两个池时归谁，取决于谁先领。必须窄池优先：龙头池全市场
-    # 命中只有 6 只，若让右侧位置3（23 只）先领，真龙会被宽池吞掉 —— 实测
-    # 6 只只剩 2 只，龙头池等于作废。展示顺序另按 POOL_DEFS，不受此影响。
+    diag = {}
 
-    # ---- 龙头接力 ----
-    if dragon.get("__error__"):
-        pools.append(_pool("dragon", icon="🐲", name="龙头接力",
-                           empty_msg="龙头扫描不可用：%s" % dragon["__error__"]))
-    else:
-        lst = [x for x in (dragon.get("list") or []) if (x.get("score") or 0) >= 80]
-        st, hit = take(lst, POOL_MAX)
-        pools.append(_pool("dragon", icon="🐲", name="龙头接力",
-                           book_ref=POOL_DEFS[3]["book_ref"], logic=POOL_DEFS[3]["logic"],
-                           scan=POOL_DEFS[3]["scan"], risk="warn", scanned=hit, stocks=st,
-                           empty_msg="今日没有四维 ≥80 的真龙，接力空仓等"))
+    def eval_scan(pid):
+        """走日K扫描的四个池：对 feat 里每只票跑一次判定，按 _sort 降序。
 
-    # ---- 龙虎榜异动 ----
-    lst = [x for x in (lhb_items or {}).values() if (x.get("net_amt") or 0) > 0]
-    lst.sort(key=lambda x: -(x.get("net_amt") or 0))
-    st, hit = take(lst, POOL_MAX)
-    pools.append(_pool("lhb", icon="🏦", name="龙虎榜异动",
-                       book_ref=POOL_DEFS[5]["book_ref"], logic=POOL_DEFS[5]["logic"],
-                       scan=POOL_DEFS[5]["scan"], risk="warn", scanned=hit, stocks=st,
-                       empty_msg="今日龙虎榜无净买入标的（或接口未返回）"))
+        ★ 异常必须计数上报，不能 `except: pass` —— 之前底背离池因为一处
+          NameError 被静默吞成「今日 0 只命中」，页面看起来像行情结论，
+          实际是代码坏了。宁可多一行 pools_note，也不能让错误假装成空态。
+        """
+        fn = _HIT[pid]
+        hits = []
+        for code, (rows, f) in feat.items():
+            ind = (pre_map.get(code) or {}).get("industry") or f.get("name") or "--"
+            try:
+                h = fn(f, rows, ind)
+            except Exception as e:
+                diag[pid] = diag.get(pid, 0) + 1
+                if diag[pid] == 1:
+                    diag[pid + "_msg"] = "%s: %s" % (type(e).__name__, e)
+                h = None
+            if h:
+                hits.append((h.get("_sort") or 0, code, rows, f, ind, h))
+        hits.sort(key=lambda x: -x[0])
+        return hits
 
-    # ---- 超短打板 ----
-    if chaoduan.get("__error__"):
-        pools.append(_pool("chaoduan", icon="⚡", name="超短打板",
-                           empty_msg="超短扫描不可用：%s" % chaoduan["__error__"]))
-    else:
-        st, hit = take(chaoduan.get("list") or [], POOL_MAX)
-        pools.append(_pool("chaoduan", icon="⚡", name="超短打板",
-                           book_ref=POOL_DEFS[0]["book_ref"], logic=POOL_DEFS[0]["logic"],
-                           scan=POOL_DEFS[0]["scan"] + "；候选池取成交额前 %d 名" % (chaoduan.get("total_scanned") or 0),
-                           risk="warn", scanned=hit, stocks=st))
+    # ---- 2) 逐池判定 ----
+    # ① 突破池
+    hits = eval_scan("breakout")
+    lst = [_stock_of(f, rows, ind, h, "breakout") for _s, _c, rows, f, ind, h in hits]
+    st, cnt = take(lst)
+    pools.append(_pool("breakout", scanned=len(hits), stocks=st, **_pool_meta("breakout"),
+                       empty_msg="今日全市场没有「创 20 日新高 + 四线多头 + 倍量收阳」"
+                                 "的突破形态，说明当前缺乏强共识突破。"))
 
-    # ---- 主升浪（只取 A、B 两类，C 是中线位）----
-    if mainwave.get("__error__"):
-        pools.append(_pool("mainwave", icon="🌊", name="主升浪",
-                           empty_msg="主升浪扫描不可用：%s" % mainwave["__error__"]))
-    else:
-        lst = list(mainwave.get("buyA") or []) + list(mainwave.get("buyB") or [])
-        st, hit = take(lst, POOL_MAX)
-        pools.append(_pool("mainwave", icon="🌊", name="主升浪",
-                           book_ref=POOL_DEFS[4]["book_ref"], logic=POOL_DEFS[4]["logic"],
-                           scan=POOL_DEFS[4]["scan"], scanned=hit, stocks=st))
-
-    # ---- 强势突破 ----
-    lst = strong.get("list") or []
-    st, hit = take(lst, POOL_MAX)
-    pools.append(_pool("strong", icon="🔥", name="强势突破",
-                       book_ref=POOL_DEFS[1]["book_ref"], logic=POOL_DEFS[1]["logic"],
-                       scan=POOL_DEFS[1]["scan"] + "（%s 收盘后数据）" % (strong.get("trade_date") or ""),
-                       scanned=hit, stocks=st,
-                       empty_msg="强势扫描结果为空，先在本页或强势页做一次收盘扫描"))
-
-    # ---- 右侧位置3（最宽，最后领）----
-    lst = [x for p in (right.get("pools") or []) for x in (p.get("stocks") or [])
-           if x.get("level_key") == "pos3"]
-    st, hit = take(lst, POOL_MAX)
-    pools.append(_pool("right3", icon="✔", name="右侧位置3",
-                       book_ref=POOL_DEFS[2]["book_ref"], logic=POOL_DEFS[2]["logic"],
-                       scan=POOL_DEFS[2]["scan"] + "（%s 收盘后数据）" % (right.get("trade_date") or ""),
-                       scanned=hit, stocks=st,
-                       empty_msg="右侧池里今日没有位置3 标的"))
-
-    # 展示顺序回到 POOL_DEFS（超短 → 强势 → 右侧 → 龙头 → 主升 → 龙虎榜）
-    _order = {d["id"]: i for i, d in enumerate(POOL_DEFS)}
-    pools.sort(key=lambda p: _order.get(p["id"], 99))
-
-    # 统一补齐：K 线 → 体检 / 量价 / 突破窗口
-    snap = engine.snapshot()
-    snap_map = {r.get("code"): r for r in (snap.get("rows") or []) if r.get("code")}
-    # 先一次性拿全行业：池子定型后才知道要哪些代码，所以放在组装之后、补齐之前。
-    ind_map = _industry_map([st["code"] for p in pools for st in p["stocks"]])
-
-    def enrich_one(st):
-        ctx = _ctx(st["code"], snap_map)
-        ind = ind_map.get(st["code"])
-        if ind:
-            st["industry"] = ind              # 行业名比 "--" 有用，前端 indPill 会直接显示
-        if not st.get("board"):
-            st["board"] = (snap_map.get(st["code"]) or {}).get("board")
+    # ② 涨停接力池（候选来自东财涨停池，不走扫描集合）
+    zt_rows = ((sent or {}).get("pools") or {}).get("zt") or []
+    cand = []
+    for r in zt_rows:
+        if not isinstance(r, dict):
+            continue
+        code = str(r.get("code") or "")
+        if code[:2] not in ("60", "00") or code not in pre_map:
+            continue
+        if engine.is_st(r.get("name") or ""):
+            continue
+        snap = snap_map.get(code) or {}
+        r["nmc_yi"] = snap.get("nmc_yi") or 0
+        ctx = feat.get(code) or _ctx(code, snap_map)
         if not ctx:
-            st["bo"] = None
-            # 前端 pi() 用 `val || "—"` 兜底，但 esc(undefined) 先变成字符串 "undefined"
-            # （真值），所以必须给完整空壳，不能只给 {}。
-            st["plan"] = {"buy_zone": "", "stop_loss": None, "stop_pct": None,
-                          "target1": None, "target2": None,
-                          "position": "", "hold": "",
-                          "sell_signal": "K 线不足 30 根，不给交易计划"}
-            st["reason"] = "K 线不足 30 根，无法给出交易计划"
-            st["tags"] = []
-            # 次新股常常没有 30 根 K 线，但快照里有当天的价格与涨幅，
-            # 不填这两个会导致卡片上「¥—」、涨跌幅空白，看着像数据丢了。
-            row0 = snap_map.get(st["code"]) or {}
-            if st.get("price") in (None, 0) and row0.get("price"):
-                st["price"] = round(float(row0["price"]), 2)
-            if st.get("pct") is None and row0.get("pct") is not None:
-                st["pct"] = round(float(row0["pct"]), 2)
+            continue
+        rows, f = ctx
+        ind = snap.get("industry") or r.get("industry") or "--"
+        try:
+            h = _hit_limit_up(r, f, ind)
+        except Exception as e:
+            diag["limit_up"] = diag.get("limit_up", 0) + 1
+            diag.setdefault("limit_up_msg", "%s: %s" % (type(e).__name__, e))
+            h = None
+        if h:
+            cand.append((h.get("_sort") or 0, code, rows, f, ind, h))
+    cand.sort(key=lambda x: -x[0])
+    lst = [_stock_of(f, rows, ind, h, "limit_up") for _s, _c, rows, f, ind, h in cand]
+    st, cnt = take(lst)
+    pools.append(_pool("limit_up", scanned=len(cand), stocks=st, **_pool_meta("limit_up"),
+                       empty_msg="今日涨停池里没有封板质量达标的票（炸板<2 次 且 封成比≥1%），"
+                                 "接力空仓等"))
+
+    # ③ 热点龙头池（板块梯队前 3，只取强度前 6 的板块）
+    lead_y = sectors or []
+    cand = []
+    for si, sec in enumerate(lead_y[:6]):
+        sec["_rank"] = si
+        for li, lad in enumerate((sec.get("ladder") or [])[:3]):
+            code = str(lad.get("code") or "")
+            if not code or code not in pre_map:
+                continue
+            ctx = feat.get(code) or _ctx(code, snap_map)
+            if not ctx:
+                continue
+            rows, f = ctx
+            ind = (pre_map.get(code) or {}).get("industry") or sec.get("name") or "--"
+            try:
+                h = _hit_leader(sec, li, lad, f, ind)
+            except Exception as e:
+                diag["leader"] = diag.get("leader", 0) + 1
+                diag.setdefault("leader_msg", "%s: %s" % (type(e).__name__, e))
+                h = None
+            if h:
+                cand.append((h.get("_sort") or 0, code, rows, f, ind, h))
+    cand.sort(key=lambda x: -x[0])
+    lst = [_stock_of(f, rows, ind, h, "leader") for _s, _c, rows, f, ind, h in cand]
+    st, cnt = take(lst)
+    pools.append(_pool("leader", scanned=len(cand), stocks=st, **_pool_meta("leader"),
+                       empty_msg="今日强势板块的梯队前 3 里没有可接力的日 K（"
+                                 "或全部是 4 板以上的高位标杆）"))
+
+    # ④ 缺口池
+    hits = eval_scan("gap")
+    lst = [_stock_of(f, rows, ind, h, "gap") for _s, _c, rows, f, ind, h in hits]
+    st, cnt = take(lst)
+    pools.append(_pool("gap", scanned=len(hits), stocks=st, **_pool_meta("gap"),
+                       empty_msg="今日与前 4 日均无「未回补的向上跳空缺口」+ 量能配合的形态"))
+
+    # ⑤ 回踩观察池
+    hits = eval_scan("pullback")
+    lst = [_stock_of(f, rows, ind, h, "pullback") for _s, _c, rows, f, ind, h in hits]
+    st, cnt = take(lst)
+    pools.append(_pool("pullback", scanned=len(hits), stocks=st, **_pool_meta("pullback"),
+                       empty_msg="没有「近 20 日涨停过、MA 多头未破、回踩 MA20 附近」的票，"
+                                 "意味今天不宜按回踩逻辑建仓"))
+
+    # ⑥ 底背离池
+    hits = eval_scan("divergence")
+    lst = [_stock_of(f, rows, ind, h, "divergence") for _s, _c, rows, f, ind, h in hits]
+    st, cnt = take(lst)
+    pools.append(_pool("divergence", scanned=len(hits), stocks=st, **_pool_meta("divergence"),
+                       empty_msg="今日没有「股价创 60 日新低而 DIF 未新低 + 缩量 + DIF 上穿 DEA」"
+                                 "的标的，超跌反弹条件未成立"))
+
+    # ---- 3) 统一补齐派生字段 ----
+    all_st = [s for p in pools for s in p["stocks"]]
+    stocks = list({s["code"]: s for s in all_st}.values())
+    ind_map = _industry_map([s["code"] for s in stocks])
+
+    def enrich(s):
+        code = s["code"]
+        ind = ind_map.get(code)
+        if ind:
+            s["industry"] = ind
+        ctx = feat.get(code) or _ctx(code, snap_map)
+        if not ctx:
+            s["vp"] = {"gate": "none", "warn": [], "confirm": [], "mid": [], "info": [],
+                       "counts": {"warn": 0, "confirm": 0, "mid": 0, "info": 0}}
+            s["checkup"] = None
+            s["chan_score"] = s["chan_grade"] = s["chan_walk"] = s["chan_bs"] = None
+            s["bo"] = None
             return
         rows, f = ctx
-        _enrich(st, rows, f, lhb_items)
-        if st.get("price") in (None, 0):
-            st["price"] = round(float(f["close"]), 2)
-        if st.get("pct") is None:
-            st["pct"] = round(float(f.get("pct") or 0), 2)
-        st["plan"] = _make_plan(rows, f, st.get("bo"))
-        st["tags"] = _tags_of(st, f)
-        st["reason"] = _reason_of(st)
-        ma10 = float(f.get("ma10") or 0)
-        if ma10 and float(f.get("close") or 0) < ma10:
-            st["risk_warn"] = True            # 收盘在 MA10 之下 = 生命线已破
+        try:
+            s["vp"] = engine.volprice(f)
+        except Exception:
+            s["vp"] = {"gate": "none", "warn": [], "confirm": [], "mid": [], "info": [],
+                       "counts": {"warn": 0, "confirm": 0, "mid": 0, "info": 0}}
+        s["gate"] = (s["vp"] or {}).get("gate")
+        try:
+            ck = engine.checkup(f)
+            s["checkup"] = {"score": ck["score"], "strategy_score": ck["strategy_score"],
+                            "verdict": ck["verdict"], "verdict_note": ck["verdict_note"],
+                            "liq_ok": ck["liq_ok"], "liquidity": ck["liquidity"],
+                            "vetoes": len(ck["vetoes"]), "weak": ck["weak"], "dims": ck["dims"]}
+            ch = ck.get("chan") or {}
+        except Exception:
+            s["checkup"] = None
+            ch = {}
+        s["chan_score"] = ch.get("score")
+        s["chan_grade"] = ch.get("grade")
+        s["chan_walk"] = ch.get("walk")
+        s["chan_bs"] = ch.get("bs")
+        s["bo"] = bo_of(rows)
+        L = (lhb_items or {}).get(code)
+        if L:
+            s["lhb"] = L
+        if s.get("price") in (None, 0):
+            s["price"] = _round(f.get("close"))
 
-    # 173 只票 ×（K 线 + 特征 + 体检 + 量价 + 突破窗口）串行要 10 秒，是首屏最大的一块开销；
-    # 每只票之间完全独立，放进线程池后本地 K 线读取与 HTTP 缓存命中的等待可以重叠。
+    # checkup 内含缠论，单票 ~60ms，串行 150 只要 9 秒；每只票彼此独立，
+    # 放进线程池把磁盘读与 HTTP 缓存命中的等待叠起来。
     with ThreadPoolExecutor(max_workers=8) as ex:
-        list(ex.map(enrich_one, [st for p in pools for st in p["stocks"]]))
+        list(ex.map(enrich, stocks))
+
     for p in pools:
         p["vp_counts"] = _vp_counts(p["stocks"])
-    return pools
+        p["stocks"].sort(key=lambda s: -(s.get("_sort") or 0))
+        for s in p["stocks"]:
+            s.pop("_sort", None)
 
+    return pools, {"total": universe_total, "prefiltered": len(pre),
+                   "kline_scanned": len(feat), "kline_cap": KLINE_SCAN_MAX}, diag
+
+
+def _diag_text(diag):
+    """把逐池异常翻成一句人话。空 dict 返回 ""，前端据此决定要不要显示。
+
+    ★ 这条通道的目的不是报错好看，而是让「0 只命中」与「代码坏了」在页面上
+      长得不一样：前者是行情结论，后者必须显眼，否则会被当成「今天没有机会」。
+    """
+    if not diag:
+        return ""
+    parts = []
+    for pid in ("breakout", "limit_up", "leader", "gap", "pullback", "divergence"):
+        n = diag.get(pid) or 0
+        if n:
+            parts.append("%s有 %d 只判定异常（首例 %s）" % (
+                POOL_BY_ID[pid]["name"], n, diag.get(pid + "_msg") or "未知"))
+    return "；".join(parts)
+
+
+def _vp_note():
+    return ("量价三分区（与「量价分析」同源口径）：⚠️警示=背离/天量/滞涨/假突破/长上影 → "
+            "gate=block，按纪律不建仓；✅确认=放量突破/缩量回调/低位堆量/低位天量/缩量涨停 → "
+            "gate=pass；○中性/观察=天量变盘窗口/地量地价 → gate=watch，无明确信息。")
+
+
+SHORT_NOTE = ("选股范围：沪深主板 60/00 · 非 ST · 总市值 < 200 亿"
+              "（用户 2026-10-04 决定不放开创业板/科创板）。"
+              "六大池标的由真实扫描得出，非硬编码。")
 
 # ---------------------------------------------------------------------------
 # 七、对外接口
 # ---------------------------------------------------------------------------
 
 METHODOLOGY = {
-    "desc": "短线作战不预测，只跟随：先判断今天能不能做（市场环境），"
-            "再判断做哪条线（主线板块），最后才是选哪只票（六个池）。"
-            "三层顺序不能颠倒 —— 环境不对时，最好的形态也会亏钱。",
+    "title": "短线作战体系",
+    "desc": "六池全部由全市场真实扫描生成（无硬编码标的），规则提炼自三本短线交易著作的公开框架。"
+            "三层顺序不能颠倒：先判断今天能不能做（市场环境）→ 做哪条线（主线板块）→ 选哪只票（六池）。",
     "rules": [
-        "先环境后个股：情绪冰点只做首板试错，仓位不超过 3 成",
-        "只做主线：板块强度 < 40 的票不接力",
-        "突破有时间窗：第 1~5 日有赔率，第 15~20 日只减不加",
-        "破 MA10 生命线即走，不给自己找理由",
-        "龙虎榜只看对手方，不参与打分",
-        "单票亏损 5% 无条件止损，不摊平",
+        "只做强势股，不碰弱势股与跟风补涨",
+        "信号出现才动手，信号失效立即止损——概率游戏，不是预言游戏",
+        "轻仓入场（单票 ≤2 成），做错小亏；只有顺势盈利才加仓",
+        "止损三档：自然止损（缺口下沿/关键低点下方）、固定止损（-5%~-8%）、均线止损（跌破 5/10/20 日线）",
+        "分批止盈，目标一个一个看，及时锁定利润，不贪长线",
+        "仓位由情绪周期决定：退潮/冰点期空仓试错，发酵/加速期才是重仓窗口",
+        "适时空仓：节奏比选股更重要",
+        "持股 1-5 日，横盘 3 日必走，不恋战",
     ],
     "sources": [
-        {"book": "游资全景看盘", "author": "", "note": "主线辨识与资金性格，用来决定打哪条线"},
-        {"book": "笑傲股市", "author": "William O'Neil", "note": "强势股与突破的时间纪律"},
-        {"book": "短线交易秘诀", "author": "Larry Williams", "note": "波动率与持仓周期的关系"},
-        {"book": "龙头股战法", "author": "", "note": "接力的前提是龙头未退潮"},
+        {"book": "游资全景看盘之板块轮动擒龙头",
+         "note": "板块层核心：先定主线板块再看个股；板块强度四维打分"
+                 "（涨幅中位数 30 + 龙头溢价 20 + 涨停占比 30 + 主力资金流 20）；"
+                 "梯队划分（高标/龙头/二线/跟风/补涨）；只做板块龙头不做跟风补涨。"},
+        {"book": "游资交易体系——21天突破",
+         "note": "21 日突破窗口与情绪周期（冰点→启动→发酵→加速→高潮→退潮）六阶段定位；"
+                 "情绪周期反推仓位上限。已接入本页「市场环境」区的仓位闸门。"},
+        {"book": "短线操盘实战技法",
+         "note": "11 章框架：操盘理念（概率思维/只做强势股/看长做短）→ "
+                 "强势个股三部曲（缺口、涨停、热点龙头）→ 风控（三档止损）→ 交易系统与投资计划。"},
     ],
 }
 
 DISCIPLINE = [
-    "不在情绪高潮日追首板 —— 那是给隔日竞价接盘的人准备的",
-    "不做没有主线的孤票，板块强度是短线的地基",
-    "突破第 15 日之后只减不加，窗口将尽时要主动验货",
-    "跌破 MA10 立即离场，不等反弹确认",
-    "龙虎榜出现机构出货或拉萨系接盘，次日不做接力",
-    "单票止损 5%、单日回撤 3% 停止交易，先停手再复盘",
+    "不追高：涨幅超 7% 的票不追，等回踩再买",
+    "不抄底：破位下跌的票不接，等企稳确认",
+    "不满仓：单票 ≤2 成，总仓按情绪周期闸门",
+    "不加仓摊平：亏损仓位只减不加",
+    "不硬扛：跌停止损、开板止盈，尾盘尽量不留隔夜风险",
+    "不做没计划的交易：每笔先定好买点、止损、目标位",
 ]
 
-DISCLAIMER = ("本页为规则化筛选与统计展示，不构成投资建议。短线交易对执行力、"
-              "滑点与情绪控制极敏感，任何一条规则失效都可能放大亏损；"
+DISCLAIMER = ("本页所有内容由量化规则自动生成，价位为技术推算值，不构成投资建议。"
+              "短线交易风险极高，请独立判断并严格执行止损纪律。"
               "龙虎榜为 T+1 盘后数据，覆盖仅当日异动个股，未上榜不等于没有主力。")
 
 _PAYLOAD = {"ts": 0.0, "td": None, "data": None}
@@ -1184,27 +1909,48 @@ def api_short(params):
     except Exception:
         sent = {}
 
-    lhb = lhb_table(force=force)
-    lhb_items = lhb.get("items") or {}
     streak_map = _streak_map(sent)
     sec_diag = {}
     sectors = _sectors(streak_map, sec_diag)
-    market = _market(sent, sectors)
-    pools = _collect(lhb_items)
+    lhb = lhb_table(force=force)
+    lhb_items = lhb.get("items") or {}
+
+    snap = engine.snapshot()
+    snap_map = {str(r.get("code")): r for r in (snap.get("rows") or []) if r.get("code")}
+
+    pools, universe, diag = _collect(sent, sectors, snap_map, lhb_items)
+    # 市场环境要报「MACD 底背离今日命中几只」，所以必须等池子先跑完 ——
+    # 这个数字不是装饰，它是「今天有没有超跌反弹机会」的判断依据。
+    div_cnt = next((p["scanned"] for p in pools if p["id"] == "divergence"), 0)
+    market = _market(sent, sectors, div_cnt)
+    # 仓位闸门的具体数字要落进纪律清单，否则「按情绪周期闸门」是一句空话
+    disc = list(DISCIPLINE)
+    disc[2] = "不满仓：单票 ≤%.0f 成，总仓按情绪周期闸门（今日 %s）" % (
+        market["advice"]["pool_pos_cap"], market["advice"]["position"])
 
     total = sum(len(p["stocks"]) for p in pools)
+    note = SHORT_NOTE
+    if universe["prefiltered"] > universe["kline_scanned"]:
+        note += ("日 K 精算按当日成交额降序取了前 %d 只（快照层命中 %d 只）—— "
+                 "成交额排序≈流动性排序，与「短线只做有量的票」同一条原则。"
+                 % (universe["kline_scanned"], universe["prefiltered"]))
     out = {
         "ok": True, "empty": total == 0,
         "trade_date": sent.get("trade_date") or td,
         "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "source": "东财龙虎榜 / 东财板块资金流 / 本地量价引擎",
+        "source": "东财涨停池 · 东财板块资金流 · 东财龙虎榜 · 本地量价引擎",
+        "note": note,
         "elapsed": round(time.time() - t0, 1),
+        "universe": universe,
         "market": market,
         "methodology": METHODOLOGY,
         "sectors": sectors,
         "sectors_note": sec_diag.get("error") or "",
+        "pools_note": _diag_text(diag),
         "pools": pools,
-        "discipline": DISCIPLINE,
+        "vp_counts": _vp_counts([s for p in pools for s in p["stocks"]]),
+        "vp_note": _vp_note(),
+        "discipline": disc,
         "disclaimer": DISCLAIMER,
         "lhb_meta": {"trade_date": lhb.get("trade_date"), "count": lhb.get("count") or 0,
                      "seats": lhb.get("seats_raw") or {}, "elapsed": lhb.get("elapsed")},
@@ -1212,8 +1958,9 @@ def api_short(params):
     if total:
         _PAYLOAD.update({"ts": now, "td": td, "data": out})
     else:
-        out["error"] = "各池均无标的：可能未做收盘扫描，或扫描结果为空"
+        out["error"] = "六个池均无标的：可能未做收盘扫描，或今日确实没有符合条件的形态"
     return out
+
 
 
 # ---- 供 /api/rescan?target=lhb 复用（前端「⟳ 刷新龙虎榜」按钮走这里）----
