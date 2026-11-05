@@ -9014,11 +9014,22 @@ function phRender(d) {
 
   if (info) info.textContent = (d.cached ? "缓存" : "实时复算") + " · " + (d.count || items.length) + " 只" +
 
+    // failed 已在服务端逐只上报，页面就必须读：否则这里写「实时复算 · 3 只」，
+    // 自选 4 只少算 1 只时，用户分不清是「我没加那只」还是「那只取数挂了」。
+    ((d.failed && d.failed.length) ? "（另有 " + d.failed.length + " 只取数失败：" +
+      d.failed.map(function (x) { return x.code; }).join("、") + "）" : "") +
+
     " · 移动止损触发 " + broke + " 只 · 时间止损 " + tstop + " 只 · " + (d.computed_at || "");
 
   if (!items.length) {
 
-    w.innerHTML = '<div class="card"><div class="mut">自选股为空，或数据不可用。</div></div>';
+    // 空态要说清是「没加自选」还是「全挂了」——这两种情况处理方式完全不同
+    var why = (d.failed && d.failed.length)
+      ? "自选股 " + d.failed.length + " 只全部取数失败：" +
+        d.failed.slice(0, 5).map(function (x) { return x.code + "（" + (x.error || "未知") + "）"; }).join("、")
+      : "自选股为空，或数据不可用。";
+
+    w.innerHTML = '<div class="card"><div class="mut">' + esc(why) + "</div></div>";
 
     return;
 
@@ -13802,7 +13813,7 @@ function initInd15() {
 
     if (d.empty || d.error) {
 
-      $("#ind15Grid").innerHTML = '<div class="empty">产业数据缺失（data/industries15.json 未找到）</div>';
+      $("#ind15Grid").innerHTML = '<div class="empty">产业映射未产出（快照为空或 ind15.build() 返回空）</div>';
 
       return;
 
@@ -13842,7 +13853,13 @@ function renderInd15() {
 
   var list = (d.list || []).filter(function (ind) { return ind15Tier === "all" || ind.tier === ind15Tier; });
 
-  $("#ind15Meta").textContent = "口径：" + (d.source || "--") + " · 更新 " + (d.updated || "--") + " · 展示 " + list.length + " 个产业";
+  $("#ind15Meta").textContent = "口径：" + (d.source || "--") + " · 更新 " + (d.updated || "--") + " · 展示 " + list.length + " 个产业" +
+
+    // 被风险警示过滤掉的票必须显式说明：原站是静态清单（还挂着旧名），本地会剔 ST，
+    // 于是「原站 34 只 / 本地 32 只」这个差额必须在页面上写清楚，否则看起来像漏抓。
+    ((d.st_filtered && d.st_filtered.length) ? " · 已剔除风险警示股 " + d.st_filtered.length + " 只（" +
+
+      d.st_filtered.map(function (x) { return x.code + " " + x.name; }).join("、") + "）" : "");
 
   $("#ind15Grid").innerHTML = list.map(function (ind) {
 

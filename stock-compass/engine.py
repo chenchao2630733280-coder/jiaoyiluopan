@@ -2366,6 +2366,7 @@ def fib4_one(f, rows):
 
 PH_TIME_BUDGET = 20      # 江恩时间止损预算（交易日）
 PH_WEAK_RETRACE = 61.8   # 回撤超过此值视为结构受损
+PH_BOX_KEEP = 6          # 箱体历史保留最近 6 个（与原站 /api/position_health 的 history 长度一致）
 
 
 def _ph_boxes(rows, sh, sl):
@@ -2388,47 +2389,78 @@ def _ph_boxes(rows, sh, sl):
     return boxes
 
 
+def _ph_box_hist(rows, boxes, keep=PH_BOX_KEEP):
+    """箱体历史（时间正序，最近 keep 个）。
+
+    ★ 为什么要把 history 单列出来，而不是让前端从 box 自己推：
+      ago 是「下沿 / 上沿各自距今天多少根 K 线」。没有这两个数字，
+      就看不出这个箱体是刚抬高的还是老箱体 —— 下沿 26 根前定的、上沿
+      13 根前定的，和上下沿都是 60 根前定的，含义完全不同。
+      字段名与含义对齐原站：lo / hi / mid / lo_ago / hi_ago。
+    """
+    n = len(rows)
+    out = []
+    for b in boxes[-keep:]:
+        lo, hi = float(b["lo"]), float(b["hi"])
+        out.append({
+            "lo": _r(lo), "hi": _r(hi), "mid": _r((lo + hi) / 2.0),
+            "lo_ago": int(n - 1 - b["from"]), "hi_ago": int(n - 1 - b["to"]),
+        })
+    return out
+
+
 def position_health_one(f, rows, name=""):
-    """单票持仓体检。返回 index.html phCard() 期望的完整结构。"""
+    """单票持仓体检。字段形状与原站 /api/position_health 的 items[] 逐一对齐。
+
+    契约（原站实测，全部字段都在前端/导出里被读过，缺一个就是半套数据）：
+      ok / code / name / price / bars / history / box / gann / time /
+      advice / advice_level / computed_at / secid
+    """
     close = f["close"]
     sh, sl = swing_points(rows, 3)
 
     # ---- 达瓦斯箱体 ----
     box = None
     all_boxes = _ph_boxes(rows, sh, sl)
+    hist = _ph_box_hist(rows, all_boxes)
     recent = all_boxes[-3:]        # 移动止损只看最近 3 箱
     if recent:
         cur = recent[-1]
-        lo, hi = cur["lo"], cur["hi"]
+        lo, hi = float(cur["lo"]), float(cur["hi"])
+        mid = (lo + hi) / 2.0
         if close < lo:
             state = "跌破箱体下沿"
         elif close > hi:
             state = "突破箱体上沿"
         else:
             state = "箱体内震荡"
-        trail = max(b["lo"] for b in recent)
-        # state_note 给自选盯盘页的悬停提示用（sellBoxPill 会去掉 ** 标记）
+        trail = max(float(b["lo"]) for b in recent)
+        # state_note 文案直接对齐原站三种情形（自选盯盘页会去掉 ** 标记当纯文本用）
         note_map = {
-            "跌破箱体下沿": "**已跌破** 箱体下沿 %.2f，达瓦斯纪律要求离场，不等反弹" % lo,
-            "突破箱体上沿": "**已突破** 箱体上沿 %.2f，趋势向上，止损可上移至 %.2f" % (hi, trail),
-            "箱体内震荡": "在箱体内运行（%.2f ~ %.2f），未破下沿，持有观察" % (lo, hi),
+            "跌破箱体下沿": "价格已跌穿最近箱体下沿，**移动止损触发** —— 按规则离场",
+            "突破箱体上沿": "价格已站上最近箱体上沿，按达瓦斯规则属**持有/加仓**区",
+            "箱体内震荡": "价格仍在最近箱体内，按规则**持有**，跌破下沿才走",
         }
+        # 箱体是否「逐级抬高」看**中轴**，不看下沿：
+        # 下沿不动、上沿抬高也是健康的箱体上移（收敛型整理），只盯下沿会漏掉。
+        prev_mid = None
+        if len(recent) >= 2:
+            prev_mid = (float(recent[-2]["lo"]) + float(recent[-2]["hi"])) / 2.0
+        rising = bool(prev_mid is not None and mid > prev_mid * 1.001)
+        rising_note = ("箱体逐级抬高 —— 趋势延续，继续持有" if rising
+                       else "箱体中轴未持续抬高 —— 趋势转平，降低预期")
         box = {
-            "lo": _r(lo), "hi": _r(hi), "state": state, "state_note": note_map[state],
-            "level": len(all_boxes),                  # 历史第几箱（前端显示「第 N 箱」）
-            "width_pct": _r((hi - lo) / lo * 100.0) if lo else None,
+            "lo": _r(lo), "hi": _r(hi),
+            "lo_ago": int(len(rows) - 1 - cur["from"]),
+            "hi_ago": int(len(rows) - 1 - cur["to"]),
+            "level": len(hist),                # 前端显示「第 N 箱」：最近 keep 个里的第几个
+            "total": len(all_boxes),           # 历史箱体总数（原站不给，留着自己可核查）
+            "state": state, "state_note": note_map[state],
+            "rising": rising, "rising_note": rising_note,
             "trail_stop": _r(trail),
             "trail_pct": _r((close / trail - 1) * 100.0) if trail else None,
-            "rising_note": "",
+            "width_pct": _r((hi - lo) / lo * 100.0) if lo else None,
         }
-        if len(recent) >= 2:
-            prev_lo = recent[-2]["lo"]
-            if lo > prev_lo * 1.005:
-                box["rising_note"] = "箱体逐级抬高：下沿 %.2f → %.2f（结构健康）" % (prev_lo, lo)
-            elif lo < prev_lo * 0.995:
-                box["rising_note"] = "箱体下移：下沿 %.2f → %.2f（需警惕）" % (prev_lo, lo)
-            else:
-                box["rising_note"] = "箱体水平，未抬高"
 
     # ---- 50% 回撤法则 / 江恩回撤 ----
     gann = None
@@ -2443,25 +2475,29 @@ def position_health_one(f, rows, name=""):
         span = leg_hi - leg_lo
         if span > 0:
             retr = (leg_hi - close) / span * 100.0
-            weak = retr > PH_WEAK_RETRACE
-            # 江恩八分法档位
-            eighths = [(12.5, "1/8"), (25.0, "2/8"), (37.5, "3/8"), (50.0, "4/8"),
-                       (62.5, "5/8"), (75.0, "6/8"), (87.5, "7/8")]
-            lab = "8/8（回吐全部涨幅）"
-            for v, nm in eighths:
-                if retr <= v:
-                    lab = nm
-                    break
-            if retr <= 0:
-                lvl = "未回撤（正处新高）"
+            mid50 = leg_hi - span * 0.5
+            if close >= leg_hi * 1.02:
+                lvl, weak = "已创新高（上涨腿延续）", False
+                note = ("上涨腿 %.3f → %.3f，现价已超过腿顶，该腿仍在延续；50%% 位置 %.3f"
+                        % (leg_lo, leg_hi, mid50))
+            elif retr <= 38.2:
+                lvl, weak = "强势（回撤 < 38.2%）", False
+                note = ("上涨腿 %.3f → %.3f，现价回撤 %.1f%%；50%% 位置 %.3f"
+                        % (leg_lo, leg_hi, retr, mid50))
+            elif retr <= PH_WEAK_RETRACE:
+                lvl, weak = "中性（回撤 38.2%%~61.8%%）", False
+                note = ("上涨腿 %.3f → %.3f，现价回撤 %.1f%%，仍在 61.8%% 以内；50%% 位置 %.3f"
+                        % (leg_lo, leg_hi, retr, mid50))
+            elif retr <= 100:
+                lvl, weak = "结构受损（> 61.8%）", True
+                note = "上涨腿 %.3f → %.3f，现价回撤 %.1f%%；50%% 位置 %.3f" % (
+                    leg_lo, leg_hi, retr, mid50)
             else:
-                lvl = "回撤 %.1f%% · %s 档" % (retr, lab)
-            note = ("上涨腿 %.2f → %.2f，回撤超 61.8%%，按法则视为结构受损，应减仓或离场"
-                    % (leg_lo, leg_hi)) if weak else \
-                   ("上涨腿 %.2f → %.2f，回撤 %.1f%% 仍在可接受范围（≤61.8%%）"
-                    % (leg_lo, leg_hi, retr))
-            gann = {"level": lvl, "weak": weak, "note": note,
-                    "retrace_pct": _r(retr), "leg_lo": _r(leg_lo), "leg_hi": _r(leg_hi)}
+                lvl, weak = "完全回吐（已跌破上涨腿起点）", True
+                note = ("上涨腿 %.3f → %.3f，现价已跌破腿起点 —— "
+                        "该上涨波段被完全回吐，结构作废" % (leg_lo, leg_hi))
+            gann = {"leg_lo": _r(leg_lo), "leg_hi": _r(leg_hi),
+                    "retr_pct": _r(retr), "level": lvl, "weak": weak, "note": note}
 
     # ---- 江恩时间止损 ----
     tm = None
@@ -2469,23 +2505,31 @@ def position_health_one(f, rows, name=""):
         low_pt = sl[-1]
         since = len(rows) - 1 - low_pt[0]
         moved = close > low_pt[1] * 1.05
+        stop = bool(since > PH_TIME_BUDGET and not moved)
+        if stop:
+            tnote = ("距最近摆动低点已 %d 个交易日（预算 %d），且未接近期间高点 —— "
+                     "**时间止损：横盘超期，资金沉没，按纪律离场**" % (since, PH_TIME_BUDGET))
+        elif moved:
+            tnote = ("距最近摆动低点 %d 个交易日（预算 %d），已走出（期间高点附近）"
+                     % (since, PH_TIME_BUDGET))
+        else:
+            tnote = ("距最近摆动低点 %d 个交易日（预算 %d），仍在预算内"
+                     % (since, PH_TIME_BUDGET))
         tm = {
-            "since_low": int(since), "budget": PH_TIME_BUDGET,
-            "stop": bool(since > PH_TIME_BUDGET and not moved),
-            "moved": bool(moved),
-            "low_price": _r(low_pt[1]), "low_date": rows[low_pt[0]][0],
+            "since_low": int(since), "low_price": _r(low_pt[1]),
+            "budget": PH_TIME_BUDGET, "moved": bool(moved), "stop": stop,
+            "note": tnote, "low_date": rows[low_pt[0]][0],
         }
 
     # ---- 结论 ----
-    # 优先级：跌破箱体下沿 > 跌破移动止损线 > 时间止损 > 回撤受损 > 突破上沿 > 持有。
+    # 优先级：跌破箱体下沿 > 跌破移动止损线 > 时间止损 > 回撤受损 > 突破上沿 > 箱内持有。
     # 「跌破移动止损线」必须排在回撤判断之前：移动止损是达瓦斯的实操核心，
     # 现价 11.54 已低于止损线 11.65 却因为回撤只有 32.8% 而判成「结构健康、持有」，
     # 是明显的误判（平安银行 2026-11-02 就是这样）。
-    advice, level = "持有观察（箱体内震荡，未触发卖出条件）", ""
     if box and box["state"] == "跌破箱体下沿":
-        advice, level = "跌破箱体下沿 → 按移动止损离场，不等反弹", "warn"
+        advice, level = ("移动止损触发：跌破箱体下沿 %.3f，按达瓦斯规则离场" % box["lo"], "warn")
     elif box and box.get("trail_pct") is not None and box["trail_pct"] < 0:
-        advice, level = ("现价已跌破移动止损线 %.2f（%.2f%%）→ 按纪律离场，止损线只上移不下移"
+        advice, level = ("现价已跌破移动止损线 %.3f（%.2f%%）→ 按纪律离场，止损线只上移不下移"
                          % (box["trail_stop"], box["trail_pct"]), "warn")
     elif tm and tm["stop"]:
         advice, level = ("距摆动低点已 %d 个交易日仍未走出（预算 %d）→ 时间止损，换仓"
@@ -2493,15 +2537,23 @@ def position_health_one(f, rows, name=""):
     elif gann and gann["weak"]:
         advice, level = "回撤已超 61.8%，结构受损 → 减仓至少一半", "warn"
     elif box and box["state"] == "突破箱体上沿":
-        advice, level = "突破箱体上沿 → 可持有并可加仓，止损上移至箱体下沿", "ok"
-    elif gann and (gann.get("retrace_pct") or 0) <= 50:
-        advice, level = "回撤在 50% 以内且未破止损线，结构健康 → 正常持有", "ok"
+        advice, level = ("突破箱体上沿 %.3f，持有并把止损上移到 %.3f"
+                         % (box["hi"], box["trail_stop"]), "ok")
+    elif box:
+        advice, level = ("箱体内持有，止损线 %.3f（跌破才走）" % box["trail_stop"], "mid")
+    else:
+        advice, level = "K 线不足，无法定位箱体 → 暂不产生卖出信号", ""
 
     return {
+        "ok": True,
         "code": f["code"], "name": name or f.get("name") or "",
         "price": _r(close), "pct": _r(f.get("pct")),
+        "bars": len(rows),
+        "history": hist,
         "box": box, "gann": gann, "time": tm,
         "advice": advice, "advice_level": level,
+        "computed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "secid": secid_of_code(f["code"]),
         "trade_date": f["date"],
     }
 

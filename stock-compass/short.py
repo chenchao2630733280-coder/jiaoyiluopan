@@ -868,6 +868,18 @@ def _market(sent, sectors, div_cnt=0):
 
 KLINE_SCAN_MAX = 1800     # 日 K 精算的硬上限，按当日成交额降序取
 
+# 均线形态回溯窗口（交易日）。原站 maform 的 grade_text 会挂出水芙蓉/断头铡刀这类
+# 形态，且带发生日期；实测这些日期分布在最近 10 个交易日内，所以取 10。
+# 太短（比如 3）会让上周刚出现的形态直接消失，太长（30）会把早就修复的结构当现行信号。
+MA_FORM_LOOKBACK = 10
+
+# 底背离「60 日价格新低」的容忍窗口（交易日）：新低必须发生在这几根之内。
+# 取 5 是实测出来的 —— 卡成「当日就是最低那一根」在 4998 只里命中 0 只
+# （最低点那天 DIF 几乎都还在 DEA 下方，金叉要等反弹一两天），
+# 放到 5 根后同口径能出 9 只，与原站该池的 6 只同一量级。
+# 放太大（20 根）会把一个月前就见底、早已反弹的票算成「当下背离」。
+DIVERGENCE_NEWLOW_WINDOW = 5
+
 
 def _universe(snap_map):
     """选股范围：沪深主板（60/00）· 非 ST · 总市值 < 200 亿。
@@ -1001,52 +1013,100 @@ def _pos52(f):
     return 100.0 if v is None else float(v)
 
 
-def _maform(f, rows):
-    """均线形态（唐能通广通形态的**可复算子集**）。
+def _ma_series(rows, n):
+    """逐日 n 日均线，与 rows 等长；不足 n 根的位置为 None。
 
-    ★ 只实现能从均线数据直接复算的两类形态，不做 18 式的全量模拟：
-      · 多头/空头排列 —— ma5/ma10/ma20/ma60 的相对位置，纯事实；
-      · 断头铡刀 —— 前一日均线多头、当日一阴同时切断 5/10/20 日线且放量，
-        这是唯一必须当风险标签外露的形态。
-      没命中就返回 grade="none"、brief="" —— 前端 `if (x.maform.brief)` 会
-      直接跳过这枚标签，不留空壳，也不编造命中。
+    ★ 为什么不用 engine.features 里的 ma5/ma10/ma20：那几个只给「当日」一个值，
+      而形态判定要判断「昨天在三线下方、今天收在三线上方」，必须要昨日的均线。
+      自己滑窗算一遍，避免为了一个辅助字段去改 features 的口径。
+    """
+    out, s = [], 0.0
+    for i, r in enumerate(rows):
+        s += float(r[2])
+        if i >= n:
+            s -= float(rows[i - n][2])
+        out.append((s / n) if (i + 1) >= n else None)
+    return out
+
+
+def _maform(f, rows):
+    """均线形态（对齐原站 /api/short 的 maform：出水芙蓉 / 多方炮 / 断头铡刀）。
+
+    ★ 原站 maform 只有六个字段 {score, grade, grade_text, brief, bear, veto}，
+      前端只消费 brief / bear / hits；实测出现过的形态名只有三种 ——
+      出水芙蓉、多方炮、断头铡刀，没命中就是「无均线形态」。
+      早先本地自拟的「四线多头 / 三线多头 / 空头排列」是自造档位：页面上会
+      出现原站根本没有的标签（`if (x.maform.brief)` 会把它当命中渲染出来），
+      所以整块换成原站三式。
+
+    ★ grade_text 必须带形态发生日（原站形如「出水芙蓉（2026-11-02）」）：
+      不带日期的话，10 个交易日前的形态和昨天的形态在页面上长得一样新。
+
+    ★ 取「回溯窗口内**最新**的一次命中」而不是优先级最高的那次：
+      2026-10-30 断头铡刀、2026-11-02 又出水芙蓉，这时候还挂断头铡刀
+      就是把已经修复的结构当成现行风险，方向会反。同一天多命中才按风险优先。
+
+    ★ score 原站同形态有 95/90/85 的浮动（由量能与位置调节），本地给固定档，
+      不去反推那套调节权重 —— 宁可差几个点，也不编一套拟合出来的公式。
     """
     base = {"score": 50, "grade": "none", "grade_text": "无均线形态",
             "brief": "", "bear": False, "veto": None, "hits": []}
-    ma5, ma10, ma20, ma60 = f.get("ma5"), f.get("ma10"), f.get("ma20"), f.get("ma60")
-    if not (ma5 and ma10 and ma20):
+    if len(rows) < 25:
         return base
-    cl = float(f["close"])
-    date = str(f.get("date") or "")
-    vr = f.get("vol_ratio") or 0
+    m5, m10, m20 = _ma_series(rows, 5), _ma_series(rows, 10), _ma_series(rows, 20)
+    n = len(rows)
+    start = max(20, n - MA_FORM_LOOKBACK)
+    for i in range(n - 1, start - 1, -1):
+        a5, a10, a20 = m5[i], m10[i], m20[i]
+        p5, p10, p20 = m5[i - 1], m10[i - 1], m20[i - 1]
+        if not (a5 and a10 and a20 and p5 and p10 and p20):
+            continue
+        d = str(rows[i][0])
+        op = float(rows[i][1])
+        cl = float(rows[i][2])
+        prev = float(rows[i - 1][2])
+        if not prev:
+            continue
+        pct = (cl / prev - 1.0) * 100.0
+        # 当日量比：当日量 / 前 5 日均量（不含当日，否则放量会被自己摊薄）
+        if i >= 5:
+            v5 = sum(float(rows[j][5]) for j in range(i - 5, i)) / 5.0
+            vr = (float(rows[i][5]) / v5) if v5 else 0.0
+        else:
+            vr = 0.0
 
-    # 断头铡刀：需要昨日三条均线，所以单独算一次「截至昨日」的均线
-    if len(rows) >= 25:
-        closes = [r[2] for r in rows[:-1]]
-        p5 = sum(closes[-5:]) / 5.0
-        p10 = sum(closes[-10:]) / 10.0
-        p20 = sum(closes[-20:]) / 20.0
-        yc = closes[-1]
-        if yc > p5 > p10 > p20 and cl < ma5 and cl < ma10 and cl < ma20 \
-                and (f.get("pct") or 0) <= -5 and vr >= 1.5:
-            return {"score": 15, "grade": "bear", "grade_text": "断头铡刀（一阴断三线）",
+        # ① 断头铡刀：昨收在多头排列的三线上方，当日一阴同时切断 5/10/20 日线且放量
+        if prev > p5 > p10 > p20 and cl < a5 and cl < a10 and cl < a20 \
+                and pct <= -4.0 and vr >= 1.3:
+            # 原站 veto 带「60 日涨幅 N% 高位」——低位断头铡刀往往只是回调，
+            # 涨了一大波之后断头才是趋势终结，这个高度信息不能省。
+            if i >= 60:
+                c60 = (cl / float(rows[i - 60][2]) - 1.0) * 100.0
+                hi_txt = " · 60 日涨幅 %.0f%%%s" % (c60, " 高位" if c60 >= 30 else "")
+            else:
+                hi_txt = ""
+            return {"score": 25, "grade": "bear", "grade_text": "断头铡刀（%s）" % d,
                     "brief": "断头铡刀", "bear": True,
-                    "veto": "断头铡刀：一阴同时切断 5/10/20 日线且放量",
-                    "hits": [{"name": "断头铡刀", "date": date,
-                              "strength": 90}]}
+                    "veto": "一阴断三线（%.1f%%）· 量比 %.2f 倍%s，趋势终结级离场信号"
+                            % (pct, vr, hi_txt),
+                    "hits": [{"name": "断头铡刀", "date": d, "strength": 90}]}
 
-    if ma60 and ma5 > ma10 > ma20 > ma60:
-        return {"score": 85, "grade": "bull", "grade_text": "四线多头排列",
-                "brief": "四线多头", "bear": False, "veto": None,
-                "hits": [{"name": "四线多头排列", "date": date, "strength": 85}]}
-    if ma5 > ma10 > ma20:
-        return {"score": 72, "grade": "bull", "grade_text": "三线多头排列",
-                "brief": "三线多头", "bear": False, "veto": None,
-                "hits": [{"name": "三线多头排列", "date": date, "strength": 72}]}
-    if ma5 < ma10 < ma20:
-        return {"score": 25, "grade": "bear", "grade_text": "空头排列",
-                "brief": "空头排列", "bear": True, "veto": None,
-                "hits": [{"name": "空头排列", "date": date, "strength": 70}]}
+        # ② 出水芙蓉：昨收在三线下方，当日放量阳线一举收上 5/10/20 日线
+        if prev < p5 and prev < p10 and prev < p20 \
+                and cl > op and cl > a5 and cl > a10 and cl > a20 and vr >= 1.2:
+            return {"score": 90, "grade": "bull", "grade_text": "出水芙蓉（%s）" % d,
+                    "brief": "出水芙蓉", "bear": False, "veto": None,
+                    "hits": [{"name": "出水芙蓉", "date": d, "strength": 85}]}
+
+        # ③ 多方炮：两阳夹一阴，第三根放量阳线收复第一根阳线的收盘
+        if i >= 2:
+            o1, c1 = float(rows[i - 2][1]), float(rows[i - 2][2])
+            o2, c2 = float(rows[i - 1][1]), float(rows[i - 1][2])
+            if c1 > o1 and c2 < o2 and o2 < c1 \
+                    and cl > op and cl > c1 and vr >= 1.2:
+                return {"score": 75, "grade": "bull", "grade_text": "多方炮（%s）" % d,
+                        "brief": "多方炮", "bear": False, "veto": None,
+                        "hits": [{"name": "多方炮", "date": d, "strength": 75}]}
     return base
 
 
@@ -1354,29 +1414,35 @@ def _hit_pullback(f, rows, ind):
 
 
 def _hit_divergence(f, rows, ind):
-    """底背离：价格创新低，而 DIF 没有跟着创新低。
+    """底背离：价格创 60 日新低，而 DIF 没有跟着创新低。
 
-    ★ 判定必须比「今天就在 60 日最低点」宽一层。实测过更严的写法：
-      要求当日收盘 = 60 日最低（1% 容差）∧ DIF>DEA，全市场 1800 只里
-      命中 **0** 只 —— 因为在最低点那天 DIF 基本都在 DEA 下方。
-      底背离是**两段**比较：把 60 根 K 线切成前后各 30 根，
-      后半段的最低价比前半段更低（价格新低），但该低点处的 DIF 比前半段
-      低点处的 DIF 更高（动能没新低）。这才是教科书里的背离。
-      当日还需 DIF>DEA（背离已被确认）、缩量地量、250 日位置 ≤45%。
+    ★ 口径按原站 /api/short 的 scan 文本：「60日价格新低而 DIF 未新低 ∧ 量比<0.75
+      ∧ DIF>DEA ∧ 250日位置≤45%」。但「新低」不能卡成「今天就是最低那一根」：
+      实测「当日收盘 = 60 日最低收盘 ∧ DIF>DEA ∧ 缩量 ∧ pos52≤45」在 4998 只里
+      命中 **0** 只 —— 因为跌到最低点那天 DIF 基本都在 DEA 下方，DIF 上穿 DEA
+      要等反弹一两天才发生。原站自己能出 6 只，说明它的「新低」允许发生在
+      最近几天内。所以这里把新低限定在最近 DIVERGENCE_NEWLOW_WINDOW 根内
+      （同口径实测近 5 日内新低 + 同条件 = 9 只，与原站 6 只同一量级）。
+
+    ★ 背离仍是「两段」比较：新低那一根之前的部分里找前一个最低收盘，
+      要求新低处的 DIF 高于前低处的 DIF —— 价格创新低而动能没创新低。
+      上ー版把窗口放宽成「前后各 30 根」是自创条件（前半段的低点可能在 55 根前），
+      命中的票价格新低已经发生一个月，跟「刚创新低」不是一回事。
+
+    ★ 当日仍需 DIF>DEA：背离只有被金叉确认才算成立，否则是下跌中继。
     """
     closes = [r[2] for r in rows]
-    cl = float(f["close"])
     if len(closes) < 65:
         return None
     seg = closes[-60:]
-    early, late = seg[:30], seg[30:]
-    pl_e, pl_l = min(early), min(late)
-    if pl_l > pl_e * 1.001:            # 后半段没创出新低
+    lo_i = min(range(60), key=lambda k: seg[k])
+    # 新低必须刚发生：距今超过窗口就是「老底」，不是当下的背离机会
+    if (59 - lo_i) > DIVERGENCE_NEWLOW_WINDOW - 1 or lo_i == 0:
         return None
+    prev = seg[:lo_i]
+    lo_e = min(range(len(prev)), key=lambda k: prev[k])
     difs = engine.macd(closes)[0][-60:]
-    d_e = difs[early.index(pl_e)]
-    i_l = 30 + late.index(pl_l)
-    d_l = difs[i_l]
+    d_l, d_e = difs[lo_i], difs[lo_e]
     if d_e is None or d_l is None or d_l <= d_e:      # DIF 同步新低 → 无背离
         return None
     dif, dea = f.get("dif"), f.get("dea")
@@ -1388,15 +1454,16 @@ def _hit_divergence(f, rows, ind):
     if _pos52(f) > 45:                               # 只做低位，不做高位假背离
         return None
 
-    bars_from_low = len(seg) - 1 - i_l
+    cl = float(f["close"])
+    bars_from_low = 59 - lo_i
     tags = ["MACD 底背离（DIF %.3f > DEA %.3f）" % (dif, dea),
             "缩量地量（量比 %.2f）" % vr,
-            "60 日低点在 %d 根前" % bars_from_low,
+            "60 日新低在 %d 根前" % bars_from_low,
             "250 日位置 %.0f%%" % _pos52(f)]
     reason = ("%s：股价创 60 日新低（%.2f → %.2f）但 MACD DIF 未同步创新低"
               "（%.3f → %.3f），形成底背离；今日缩量（量比 %.2f）且 DIF 上穿 DEA，"
               "超跌反弹条件成立。注意：底背离属反弹型机会，仓位须低于趋势买入。") % (
-        ind, pl_e, pl_l, d_e, d_l, vr)
+        ind, seg[lo_e], seg[lo_i], d_e, d_l, vr)
     # 买点：不追高，等缩量回踩到现价下方 4%；止损：现价 -8%（20 日最低通常太远）
     buy_lo, buy_hi = cl * 0.96, cl
     stop = cl * 0.92
@@ -1409,6 +1476,7 @@ def _hit_divergence(f, rows, ind):
             "hi_risk": True, "plan": plan, "_sort": -bars_from_low}
 
 
+# 池 id → 判定函数。eval_scan 按这个表派发，缺一个键就是「该池 0 只命中」。
 _HIT = {
     "breakout": _hit_breakout,
     "gap": _hit_gap,
@@ -1668,8 +1736,10 @@ def _collect(sent, sectors, snap_map, lhb_items=None):
     hits = eval_scan("breakout")
     lst = [_stock_of(f, rows, ind, h, "breakout") for _s, _c, rows, f, ind, h in hits]
     st, cnt = take(lst)
+    # ★ 空态文案必须与原站 scan 条件用同一套词：这里写「四线多头」而 scan 是
+    #   MA5>MA10>MA20，读者会以为池子还多了一道四线条件，进而怀疑是不是条件太严。
     pools.append(_pool("breakout", scanned=len(hits), stocks=st, **_pool_meta("breakout"),
-                       empty_msg="今日全市场没有「创 20 日新高 + 四线多头 + 倍量收阳」"
+                       empty_msg="今日全市场没有「收盘创 20 日新高 + MA5>MA10>MA20 + 放量收阳」"
                                  "的突破形态，说明当前缺乏强共识突破。"))
 
     # ② 涨停接力池（候选来自东财涨停池，不走扫描集合）

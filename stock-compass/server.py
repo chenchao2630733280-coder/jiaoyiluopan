@@ -1924,24 +1924,31 @@ def api_position_health(params):
         d["cached"] = True
         return d
 
-    items, td = [], engine.latest_trade_date()
+    # ★ failed 必须逐只记账，不能 continue 了事：原站顶层有这个字段，前端拿它判断
+    #   「是我没加自选，还是有票算失败了」。一只票的 K 线拿不到就静静消失，
+    #   页面上看起来跟「我本来就没加它」一模一样，这种静默会让人误判仓位风险。
+    items, failed, td = [], [], engine.latest_trade_date()
     for c in codes:
         try:
             code, s, rows, f, err = _stock_ctx(c)
             if err or not f:
+                failed.append({"code": c, "error": str(err or "无日K数据")})
                 continue
             it = engine.position_health_one(f, rows, (s or {}).get("name") or "")
             it["checkup"] = None
             items.append(it)
             td = f.get("date") or td
-        except Exception:
-            continue
+        except Exception as e:
+            failed.append({"code": c, "error": "计算异常：%s" % type(e).__name__})
 
     out = {
-        "ok": True, "items": items, "count": len(items),
+        "ok": True, "items": items, "failed": failed, "count": len(items),
         "cached": False,
         "computed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "trade_date": td,
+        # 原站 source 写的是离线文件路径；本地是实时算自选股，来源文案必须说真话，
+        # 不能照抄「离线批量产出」骗人说有落盘。
+        "source": "自选股日K实时计算（不落盘，30 秒内存缓存）",
         "note": "达瓦斯箱体（近 3 箱下沿最高者为移动止损线，只上移不下移）· "
                 "江恩时间止损（距摆动低点 %d 个交易日为预算）· "
                 "50%% 回撤法则（回撤 >%.1f%% 视为结构受损）。"
